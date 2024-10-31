@@ -1,0 +1,1094 @@
+#include "utility.h"
+#include "ikd-Tree/ikd_Tree.h"
+
+#define G_m_s2 (9.81)               // Gravaty const in GuangDong/China
+#define NUM_MATCH_POINTS    (5)    
+#define LASER_POINT_COV (0.001)
+#define VEC_FROM_ARRAY(v)        v[0],v[1],v[2]
+#define MAT_FROM_ARRAY(v)        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
+#define SKEW_SYM_MATRX(v)        0.0,-v[2],v[1],v[2],0.0,-v[0],-v[1],v[0],0.0
+#define DEBUG_FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
+
+using namespace std;
+
+typedef Eigen::Vector3d V3D;
+typedef Eigen::Matrix3d M3D;
+typedef Eigen::Vector3f V3F;
+typedef Eigen::Matrix3f M3F;
+typedef pcl::PointXYZINormal PointType;
+typedef pcl::PointCloud<PointType> PointCloudXYZI;
+typedef vector<PointType, Eigen::aligned_allocator<PointType>>  PointVector;
+
+KD_TREE<PointType> ikdtree;
+const float MOV_THRESHOLD = 1.5f;
+const double epsi = 0.001; // ESKF迭代时，如果dx<epsi 认为收敛
+bool point_selected_surf[100000] = {1};							  //判断是否是有效特征点
+
+enum LidType
+{
+  AVIA      = 1,
+  MID360,
+  VELO16,
+  OUST64,
+  RS32
+};
+
+enum TIME_UNIT
+{
+  SEC = 0,
+  MS = 1,
+  US = 2,
+  NS = 3
+};
+
+class Param
+{
+public:
+
+    string  lidTopic;
+    string  imuTopic;
+    bool    enPath;
+    bool    enScanPub;                      // 是否发布当前正在扫描的点云的topic
+    bool    enDensePub;                     // 是否发布经过运动畸变校正注册到IMU坐标系的点云的topic
+    bool    enScanBodyPub;                  // 是否发布经过运动畸变校正注册到IMU坐标系的点云的topic，需要该变量和上一个变量同时为true才发布
+    int     nMaxIter;                       // 卡尔曼滤波的最大迭代次数
+    string  mapFilePath;                    // 地图保存路径
+    bool    enTimeSync;                     // 是否需要时间同步，只有当外部未进行时间同步时设为true
+    double  timeDiffL2I;
+    double  minCornerFilterSize;            // VoxelGrid降采样时的体素大小
+    double  minSurfFilterSize;
+    double  minMapFilterSize;
+    double  cubeLen;                        // 地图的局部区域的长度（FastLio2论文中有解释）
+    double  detRange;                       // 激光雷达的最大探测范围
+    double  fovDeg;
+    double  gyrCov;                         // IMU陀螺仪的协方差
+    double  accCov;                         // IMU加速度计的协方差
+    double  bGyrCov;                        // IMU陀螺仪偏置的协方差
+    double  bAccCov;                        // IMU加速度计偏置的协方差
+    double  blind;                          // 最小距离阈值，即过滤掉0～blind范围内的点云
+    int     lidType;                        // 激光雷达的类型
+    int     N_SCANS;                        // 激光雷达扫描的线数（livox avia为6线）
+    int     SCAN_RATE;
+    int     timeUnit;
+    int     nPointFilter;                   // 采样间隔，即每隔point_filter_num个点取1个点
+    bool    enFeature;                      // 是否提取特征点（FAST_LIO2默认不进行特征点提取）
+    bool    enEstExtrinsic;
+    bool    enSavePcd;                      // 是否将点云地图保存到PCD文件
+    int     pcdSaveInterval;
+    vector<double>  extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+    vector<double>  extrinR;                // 雷达相对于IMU的外参R
+};
+
+struct MeasureGroup     // Lidar data and imu dates for the current process
+{
+    MeasureGroup()
+    {
+        lidBigTime = 0.0;
+        this->lid.reset(new PointCloudXYZI());
+    };
+    double lidBigTime;
+    double lidEndTime;
+    PointCloudXYZI::Ptr lid;
+    deque<sensor_msgs::Imu::ConstPtr> imu;
+};
+
+struct ImuData
+{
+	V3D acc = Eigen::Vector3d(0,0,0);
+	V3D gyr = Eigen::Vector3d(0,0,0);
+};
+
+struct EskfDynData
+{
+    bool valid;												   //有效特征点数量是否满足要求
+    bool converge;											   //迭代时，是否已经收敛
+    Eigen::Matrix<double, Eigen::Dynamic, 1> h;				   //残差	(公式(14)中的z)
+    Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> h_x; //雅可比矩阵H (公式(14)中的H)
+};
+
+typedef Eigen::Matrix<double, 24, 24> COV;				// 24X24的协方差矩阵
+typedef Eigen::Matrix<double, 24, 1>  StateV24;        // 24X1的向量
+struct  StateVal
+{
+	Eigen::Vector3d pos = Eigen::Vector3d(0,0,0);
+	Sophus::SO3 rot = Sophus::SO3(Eigen::Matrix3d::Identity());
+	Sophus::SO3 extrinR = Sophus::SO3(Eigen::Matrix3d::Identity());
+	Eigen::Vector3d extrinT = Eigen::Vector3d(0,0,0);
+	Eigen::Vector3d vel = Eigen::Vector3d(0,0,0);
+	Eigen::Vector3d bg = Eigen::Vector3d(0,0,0);
+	Eigen::Vector3d ba = Eigen::Vector3d(0,0,0);
+	Eigen::Vector3d grav = Eigen::Vector3d(0,0,-G_m_s2);
+};
+
+//判断点的时间先后顺序(注意curvature中存储的是时间戳)
+const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
+
+class LaserMapping
+{
+private:
+
+    ros::NodeHandle nh;
+    Param pa;
+
+
+    ros::Subscriber subLid;             // 订阅原始激光点云
+    ros::Subscriber subImu;             // imu数据队列（原始数据，转lidar系下）
+
+    ros::Publisher  pubLid;
+    ros::Publisher  pubCurPcl;
+    ros::Publisher  pubMap;
+    ros::Publisher  pubPath;
+
+    double curTime;
+
+    std::deque<double> timeBuffer;
+    std::deque<PointCloudXYZI::Ptr> lidBuffer;
+    std::deque<sensor_msgs::Imu::ConstPtr> imuBuffer;
+
+    sensor_msgs::ImuConstPtr lastImu;
+    double lastLidEndTime;
+
+    bool imuInited;
+    V3D mean_acc;                           //加速度均值,用于计算方差
+    V3D mean_gyr;                           //角速度均值，用于计算方差
+    V3D cov_acc;             //加速度协方差
+    V3D cov_gyr;             //角速度协方差
+    V3D cov_acc_b;             //加速度协方差
+    V3D cov_gyr_b;             //角速度协方差
+    vector<ww_lslam::Pose6D> IMUpose;                 // 存储imu位姿(反向传播用)
+
+    PointCloudXYZI::Ptr pclPjt;
+    PointCloudXYZI::Ptr pclPjtDown;
+    PointCloudXYZI::Ptr pclPjtDownWorld;
+
+    StateVal X;
+    COV P = COV::Identity();
+
+    vector<BoxPointType> cub_needrm;
+    BoxPointType LocalMap_Points;      // ikd-tree地图立方体的2个角点
+    bool Localmap_Initialized = false; // 局部地图是否初始化
+    vector<PointVector> Nearest_Points;
+    pcl::VoxelGrid<PointType> downSizeFilterSurf;
+    pcl::VoxelGrid<PointType> downSizeFilterMap;
+
+    nav_msgs::Path path;
+
+    std::mutex imuLock;
+    std::mutex lidLock;
+
+public:
+    LaserMapping()
+    {
+        readParm();
+
+        reset();
+
+        // 订阅原始imu数据
+        subImu = nh.subscribe(pa.imuTopic, 2000, &LaserMapping::imuHandler, this, ros::TransportHints().tcpNoDelay());
+
+        // 订阅原始lidar数据
+        switch (pa.lidType)
+        {
+        case MID360:
+        case AVIA:
+            subLid = nh.subscribe<livox_ros_driver::CustomMsg>(
+                     pa.lidTopic, 5, &LaserMapping::livoxLidHandler, this, ros::TransportHints().tcpNoDelay());
+            break;
+        default:
+            break;
+        }
+
+        pubPath     = nh.advertise<nav_msgs::Path>("/path", 100000);
+        pubCurPcl   = nh.advertise<sensor_msgs::PointCloud2>("/cur_pcl", 100000);
+        pubMap      = nh.advertise<sensor_msgs::PointCloud2>("/map", 100000);
+
+
+
+    }
+
+    void reset()
+    {
+        imuInited = false;
+        cov_gyr = V3D(pa.gyrCov, pa.gyrCov, pa.gyrCov);
+        cov_acc = V3D(pa.accCov, pa.accCov, pa.accCov);
+        cov_acc_b = V3D(pa.bAccCov, pa.bAccCov, pa.bAccCov);
+        cov_gyr_b = V3D(pa.bGyrCov, pa.bGyrCov, pa.bGyrCov);
+
+        pclPjt.reset(new PointCloudXYZI()); 
+        pclPjtDown.reset(new PointCloudXYZI());
+        pclPjtDownWorld.reset(new PointCloudXYZI()); 
+
+        X.extrinT << VEC_FROM_ARRAY(pa.extrinT);      //将lidar和imu外参传入
+        Eigen::Matrix3d extrinR = Eigen::Matrix3d::Identity();
+        extrinR << MAT_FROM_ARRAY(pa.extrinR);
+        X.extrinR = Sophus::SO3(extrinR);
+
+        Eigen::Matrix<double, 24, 24> init_P = Eigen::MatrixXd::Identity(24,24);      //在esekfom.hpp获得P_的协方差矩阵
+        init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
+        init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
+        init_P(15,15) = init_P(16,16) = init_P(17,17) = 0.0001;
+        init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
+        init_P(21,21) = init_P(22,22) = init_P(23,23) = 0.00001; 
+        P = init_P;
+
+        downSizeFilterSurf.setLeafSize(pa.minSurfFilterSize, pa.minSurfFilterSize, pa.minSurfFilterSize);
+        downSizeFilterMap.setLeafSize(pa.minMapFilterSize, pa.minMapFilterSize, pa.minMapFilterSize);
+
+        ikdtree.set_downsample_param(pa.minMapFilterSize);
+
+        path.header.stamp = ros::Time::now();
+        path.header.frame_id = "camera_init";
+    }
+
+    void readParm()
+    {
+        nh.param<bool>("publish/path_en", pa.enPath, true);
+        nh.param<bool>("publish/scan_publish_en", pa.enScanPub, true);            // 是否发布当前正在扫描的点云的topic
+        nh.param<bool>("publish/dense_publish_en", pa.enDensePub, true);          // 是否发布经过运动畸变校正注册到IMU坐标系的点云的topic
+        nh.param<bool>("publish/scan_bodyframe_pub_en", pa.enScanBodyPub, true); // 是否发布经过运动畸变校正注册到IMU坐标系的点云的topic，需要该变量和上一个变量同时为true才发布
+        nh.param<int>("max_iteration", pa.nMaxIter, 4);                   // 卡尔曼滤波的最大迭代次数
+        nh.param<string>("map_file_path", pa.mapFilePath, "");                    // 地图保存路径
+        nh.param<string>("common/lid_topic", pa.lidTopic, "/livox/lidar");         // 雷达点云topic名称
+        nh.param<string>("common/imu_topic", pa.imuTopic, "/livox/imu");           // IMU的topic名称
+        nh.param<bool>("common/time_sync_en", pa.enTimeSync, false);              // 是否需要时间同步，只有当外部未进行时间同步时设为true
+        nh.param<double>("common/time_offset_lidar_to_imu", pa.timeDiffL2I, 0.0);
+        nh.param<double>("filter_size_corner", pa.minCornerFilterSize, 0.5); // VoxelGrid降采样时的体素大小
+        nh.param<double>("filter_size_surf", pa.minSurfFilterSize, 0.5);
+        nh.param<double>("filter_size_map", pa.minMapFilterSize, 0.5);
+        nh.param<double>("cube_side_length", pa.cubeLen, 200);    // 地图的局部区域的长度（FastLio2论文中有解释）
+        nh.param<double>("mapping/det_range", pa.detRange, 300.f); // 激光雷达的最大探测范围
+        nh.param<double>("mapping/fov_degree", pa.fovDeg, 180);
+        nh.param<double>("mapping/gyr_cov", pa.gyrCov, 0.1);               // IMU陀螺仪的协方差
+        nh.param<double>("mapping/acc_cov", pa.accCov, 0.1);               // IMU加速度计的协方差
+        nh.param<double>("mapping/b_gyr_cov", pa.bGyrCov, 0.0001);        // IMU陀螺仪偏置的协方差
+        nh.param<double>("mapping/b_acc_cov", pa.bAccCov, 0.0001);        // IMU加速度计偏置的协方差
+        nh.param<double>("preprocess/blind", pa.blind, 0.01);        // 最小距离阈值，即过滤掉0～blind范围内的点云
+        nh.param<int>("preprocess/lidar_type", pa.lidType, AVIA); // 激光雷达的类型
+        nh.param<int>("preprocess/scan_line", pa.N_SCANS, 16);       // 激光雷达扫描的线数（livox avia为6线）
+        nh.param<int>("preprocess/timestamp_unit", pa.timeUnit, US);
+        nh.param<int>("preprocess/scan_rate", pa.SCAN_RATE, 10);
+        nh.param<int>("point_filter_num", pa.nPointFilter, 2);           // 采样间隔，即每隔point_filter_num个点取1个点
+        nh.param<bool>("feature_extract_enable", pa.enFeature, false); // 是否提取特征点（FAST_LIO2默认不进行特征点提取）
+        nh.param<bool>("mapping/extrinsic_est_en", pa.enEstExtrinsic, true);
+        nh.param<bool>("pcd_save/pcd_save_en", pa.enSavePcd, false); // 是否将点云地图保存到PCD文件
+        nh.param<int>("pcd_save/interval", pa.pcdSaveInterval, -1);
+        nh.param<vector<double>>("mapping/extrinsic_T", pa.extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+        nh.param<vector<double>>("mapping/extrinsic_R", pa.extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
+    }
+
+    void livoxLidHandler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
+    {
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        PointType pt, lastPt;
+        
+        int nPts = msg->point_num;
+        uint gap = pa.nPointFilter;
+        for (uint i = 1; i < nPts; i+=gap)
+        {
+            if ((msg->points[i].line < pa.N_SCANS) 
+            && ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
+            {
+                pt.x = msg->points[i].x;
+                pt.y = msg->points[i].y;
+                pt.z = msg->points[i].z;
+                pt.intensity = msg->points[i].reflectivity;
+                pt.curvature = msg->points[i].offset_time * 1e-9f; 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock1(lidLock);
+        lidBuffer.push_back(pclPtr);
+        timeBuffer.push_back(msg->header.stamp.toSec());
+        //cerr <<"in " << lidBuffer.size();
+    }
+
+    void imuHandler(const sensor_msgs::Imu::ConstPtr &msg)
+    {
+        std::lock_guard<std::mutex> lock1(imuLock);
+        imuBuffer.push_back(msg);
+    }
+
+    void processThread()
+    {
+        ros::Rate rate(5000);
+        while (ros::ok())
+        {
+            process();
+            rate.sleep();
+        }
+    }
+
+    void process()
+    {
+        bool state = false;
+
+        MeasureGroup measDate;
+        state = syncPackages(measDate);
+        if (!state) return ;
+
+        if (!imuInited)
+        {
+            imuInit(measDate);
+            imuInited = true;
+            cerr << "imu init done." << endl;
+            return;
+        }
+
+        imuPreint(measDate);
+
+        projectPcl(measDate, pclPjt);
+
+        V3D lidPos = X.pos + X.rot.matrix() * X.extrinT;
+        cerr << "lid pose: " << lidPos(0) << " " << lidPos(1) << " " << lidPos(2) << endl;
+        lasermap_fov_segment(lidPos);
+
+        //点云下采样
+        downSizeFilterSurf.setInputCloud(pclPjt);
+        downSizeFilterSurf.filter(*pclPjtDown);
+        int npts  = pclPjtDown->points.size();
+
+        pclPjtDownWorld->resize(npts);
+        for (int i = 0; i < npts; i++)
+        {
+            pointBodyToWorld(&(pclPjtDown->points[i]), &(pclPjtDownWorld->points[i])); // lidar坐标系转到世界坐标系
+        }
+
+        //初始化ikdtree(ikdtree为空时)
+        if (ikdtree.Root_Node == nullptr)
+        {
+            ikdtree.Build(pclPjtDownWorld->points); //根据世界坐标系下的点构建ikdtree
+            return;
+        }
+
+        /*** iterated state estimation ***/
+        Nearest_Points.resize(npts); //存储近邻点的vector
+        eskfUpdte(pclPjtDown);
+
+        lidPos = X.pos + X.rot.matrix() * X.extrinT;
+
+        /*** add the feature points to map kdtree ***/
+        pclPjtDownWorld->resize(npts);
+        map_incremental(pclPjtDownWorld);
+
+        if (pa.enPath)
+        {
+            publishPath();
+        }
+        publishCurPcl();
+        publishMap();
+
+    }
+
+    bool syncPackages(MeasureGroup &meas)
+    {
+        //cerr <<"syn " << lidBuffer.size();
+        if (lidBuffer.size() <= 2)
+        {
+            return false;
+        }
+
+        PointCloudXYZI::Ptr lid = lidBuffer.front();
+        double lidBigTime = timeBuffer.front();
+        double lidEndTime = lidBigTime + lid->points.back().curvature;
+
+        // 要求imu数据包含激光数据，否则不往下处理了
+        if (imuBuffer.front()->header.stamp.toSec() > lidBigTime)
+        {
+            lidBuffer.pop_front();
+            timeBuffer.pop_front();
+            return false;
+        }
+
+        if (imuBuffer.empty() || imuBuffer.back()->header.stamp.toSec() < lidEndTime)
+        {
+            ROS_DEBUG("Waiting for IMU data ...");
+            return false;
+        }
+
+        // 从imu队列中删除当前激光帧前面时刻的imu数据
+        while (!imuBuffer.empty())
+        {
+            if (imuBuffer.front()->header.stamp.toSec() < lidBigTime)
+                imuBuffer.pop_front();
+            else
+                break;
+        }
+
+        if (imuBuffer.empty())
+            return false;
+
+        // 遍历当前激光帧起止时刻之间的imu数据
+        meas.imu.clear();
+        for (int i = 0; i < (int)imuBuffer.size(); ++i)
+        {
+            sensor_msgs::Imu::ConstPtr thisImu = imuBuffer[i];
+            double imuTime = thisImu->header.stamp.toSec();
+
+            // 超过当前激光帧结束时刻，结束
+            if (imuTime > lidEndTime)
+                break;
+
+            meas.imu.push_back(thisImu);
+        }
+
+        curTime = lidEndTime;
+        meas.lidBigTime = lidBigTime;
+        meas.lidEndTime = lidEndTime;
+        meas.lid = lid;
+        lidBuffer.pop_front();
+        timeBuffer.pop_front();
+
+        std::cerr << std::setprecision(15) 
+        << lidBuffer.size() << " "
+        << lidBigTime << " " << lidEndTime << " " 
+        << meas.imu.front()->header.stamp.toSec() << " "
+        << meas.imu.back()->header.stamp.toSec() << std::endl;
+
+        return true;
+    }
+
+    //广义加法  公式(4)
+    StateVal StatePlus(StateVal x, Eigen::Matrix<double, 24, 1> dx)
+    {
+        StateVal x_r;
+        x_r.pos = x.pos + dx.block<3, 1>(0, 0);
+
+        x_r.rot = x.rot * Sophus::SO3::exp(dx.block<3, 1>(3, 0));
+        x_r.extrinR = x.extrinR * Sophus::SO3::exp(dx.block<3, 1>(6, 0));
+
+        x_r.extrinT = x.extrinT + dx.block<3, 1>(9, 0);
+        x_r.vel = x.vel + dx.block<3, 1>(12, 0);
+        x_r.bg = x.bg + dx.block<3, 1>(15, 0);
+        x_r.ba = x.ba + dx.block<3, 1>(18, 0);
+        x_r.grav = x.grav + dx.block<3, 1>(21, 0);
+
+        return x_r;
+    }
+
+    void imuInit(const MeasureGroup &meas)
+    {
+        //MeasureGroup这个struct表示当前过程中正在处理的所有数据，包含IMU队列和一帧lidar的点云 以及lidar的起始和结束时间
+        //初始化重力、陀螺仪偏差、acc和陀螺仪协方差  将加速度测量值归一化为单位重力   **/
+        const auto &imu_acc = meas.imu.front()->linear_acceleration;    //IMU初始时刻的加速度
+        const auto &gyr_acc = meas.imu.front()->angular_velocity;       //IMU初始时刻的角速度
+        mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;              //第一帧加速度值作为初始化均值
+        mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;              //第一帧角速度值作为初始化均值
+
+        int N = 1;
+        V3D cur_acc, cur_gyr;
+        for (const auto &imu : meas.imu)    //根据所有IMU数据，计算平均值和方差
+        {
+            const auto &imu_acc = imu->linear_acceleration;
+            const auto &gyr_acc = imu->angular_velocity;
+            cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
+            cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
+
+            mean_acc  += (cur_acc - mean_acc) / N;    //根据当前帧和均值差作为均值的更新
+            mean_gyr  += (cur_gyr - mean_gyr) / N;
+
+            N ++;
+        }
+        
+        X.grav = - mean_acc / mean_acc.norm() * G_m_s2;    //得平均测量的单位方向向量 * 重力加速度预设值
+        X.bg   = mean_gyr;      //角速度测量作为陀螺仪偏差
+    }
+
+    void imuUnitPreint(double &dt, Eigen::Matrix<double, 12, 12> &Q, const ImuData &in)
+    {
+        // 对应顺序为速度(3)，角速度(3),外参T(3),外参旋转R(3)，加速度(3),角速度偏置(3),加速度偏置(3),位置(3)，与论文公式顺序不一致
+        Eigen::Matrix<double, 24, 1> f = Eigen::Matrix<double, 24, 1>::Zero();	  //公式(3)的f
+        V3D omega = in.gyr - X.bg;		// 输入的imu的角速度(也就是实际测量值) - 估计的bias值(对应公式的第1行)
+        V3D a_inertial = X.rot.matrix() * (in.acc - X.ba);		//  输入的imu的加速度，先转到世界坐标系（对应公式的第3行）
+        for (int i = 0; i < 3; i++)
+        {
+            f(i) = X.vel[i];		//速度（对应公式第2行）
+            f(i + 3) = omega[i];	//角速度（对应公式第1行）
+            f(i + 12) = a_inertial[i] + X.grav[i];		//加速度（对应公式第3行）
+        }
+
+        //对应公式(7)的Fx  注意该矩阵没乘dt，没加单位阵
+        Eigen::Matrix<double, 24, 24> fx = Eigen::Matrix<double, 24, 24>::Zero();
+        fx.block<3, 3>(0, 12) = Eigen::Matrix3d::Identity();	//对应公式(7)第2行第3列   I
+        V3D acc_ = in.acc - X.ba;   	//测量加速度 = a_m - bias	
+
+        fx.block<3, 3>(12, 3) = -X.rot.matrix() * Sophus::SO3::hat(acc_);		//对应公式(7)第3行第1列
+        fx.block<3, 3>(12, 18) = -X.rot.matrix(); 				//对应公式(7)第3行第5列 
+
+        fx.template block<3, 3>(12, 21) = Eigen::Matrix3d::Identity();		//对应公式(7)第3行第6列   I
+        fx.template block<3, 3>(3, 15) = -Eigen::Matrix3d::Identity();		//对应公式(7)第1行第4列 (简化为-I)
+
+        //对应公式(7)的Fw  注意该矩阵没乘dt
+        Eigen::Matrix<double, 24, 12> fw = Eigen::Matrix<double, 24, 12>::Zero();
+        fw.block<3, 3>(12, 3) = -X.rot.matrix();					//对应公式(7)第3行第2列  -R 
+        fw.block<3, 3>(3, 0) = -Eigen::Matrix3d::Identity();		//对应公式(7)第1行第1列  -A(w dt)简化为-I
+        fw.block<3, 3>(15, 6) = Eigen::Matrix3d::Identity();		//对应公式(7)第4行第3列  I
+        fw.block<3, 3>(18, 9) = Eigen::Matrix3d::Identity();		//对应公式(7)第5行第4列  I
+
+        X = StatePlus(X, f * dt); //前向传播 公式(4)
+        // std::cout << "P: " << P << std::endl;
+        // std::cout << "Q: " << Q << std::endl;
+        fx = Eigen::Matrix<double, 24, 24>::Identity() + fx * dt; //之前Fx矩阵里的项没加单位阵，没乘dt   这里补上
+        P = (fx) * P * (fx).transpose() + (dt * fw) * Q * (dt * fw).transpose(); //传播协方差矩阵，即公式(8)
+        // std::cout << "dt: " << dt << std::endl;
+        // std::cout << "fx: " << fx << std::endl;
+        // std::cout << "fw: " << fx << std::endl;
+        // getchar();
+    }
+
+    void imuPreint(const MeasureGroup &meas)
+    {
+        /***将上一帧最后尾部的imu添加到当前帧头部的imu ***/
+        deque<sensor_msgs::Imu::ConstPtr> v_imu = meas.imu;         //取出当前帧的IMU队列
+        const double &imu_end_time = v_imu.back()->header.stamp.toSec();    //拿到当前帧尾部的imu的时间
+        const double &pcl_beg_time = meas.lidBigTime;      // 点云开始和结束的时间戳
+
+        IMUpose.clear();
+        V3D _acc = V3D(0., 0., 0.);               //加速度协方差初始化
+        V3D _gyr = V3D(0., 0., 0.);               //角速度协方差初始化
+        IMUpose.push_back(set_pose6d(0.0, _acc, _gyr, X.vel, X.pos, X.rot.matrix()));
+        //将初始状态加入IMUpose中,包含有时间间隔，上一帧加速度，上一帧角速度，上一帧速度，上一帧位置，上一帧旋转矩阵
+
+        /*** 前向传播 ***/
+        V3D angvel_avr, acc_avr; // angvel_avr为平均角速度，acc_avr为平均加速度，acc_imu为imu加速度，vel_imu为imu速度，pos_imu为imu位置
+        double dt = 0;
+        ImuData in;
+        Eigen::Matrix<double, 12, 12> Q = Eigen::MatrixXd::Zero(12, 12);
+        for  (size_t i = 0; i < v_imu.size(); i++)
+        {
+
+            sensor_msgs::Imu::ConstPtr tail = v_imu[i];
+            if (i == 0)
+            {
+                angvel_avr << tail->angular_velocity.x, tail->angular_velocity.y, tail->angular_velocity.z;
+                acc_avr << tail->linear_acceleration.x, tail->linear_acceleration.y, tail->linear_acceleration.z;
+                dt = tail->header.stamp.toSec() - pcl_beg_time;
+            }
+            else
+            {
+                sensor_msgs::Imu::ConstPtr head = v_imu[i - 1];
+                angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),      // 中值积分
+                            0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+                            0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+                acc_avr   <<0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x),
+                            0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
+                            0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+                dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
+            }
+            acc_avr  = acc_avr * G_m_s2 / mean_acc.norm();
+
+            in.acc = acc_avr;
+            in.gyr = angvel_avr;
+            Q.block<3, 3>(0, 0).diagonal() = cov_gyr;         // 配置协方差矩阵
+            Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+            Q.block<3, 3>(6, 6).diagonal() = cov_gyr_b;
+            Q.block<3, 3>(9, 9).diagonal() = cov_acc_b;
+            imuUnitPreint(dt, Q, in);
+
+            double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;    //后一个IMU时刻距离此次雷达开始的时间间隔
+            IMUpose.push_back( set_pose6d( offs_t, _acc, _gyr, X.vel, X.pos, X.rot.matrix() ) );
+        }
+
+        dt = abs(meas.lidEndTime - v_imu.back()->header.stamp.toSec());
+        imuUnitPreint(dt, Q, in);
+    }
+
+    ww_lslam::Pose6D set_pose6d(const double t, const V3D &a, const V3D &g, 
+                                const Eigen::Vector3d &v, const Eigen::Vector3d &p, const Eigen::Matrix3d &R)
+    {
+        ww_lslam::Pose6D rot_kp;
+        rot_kp.offset_time = t;
+        for (int i = 0; i < 3; i++)
+        {
+            rot_kp.acc[i] = a(i);
+            rot_kp.gyr[i] = g(i);
+            rot_kp.vel[i] = v(i);
+            rot_kp.pos[i] = p(i);
+            for (int j = 0; j < 3; j++)  rot_kp.rot[i*3+j] = R(i,j);
+        }
+        return move(rot_kp);
+    }
+
+    void projectPcl(const MeasureGroup &meas, PointCloudXYZI::Ptr &pclPjt)
+    {
+        // 根据点云中每个点的时间戳对点云进行重排序
+        PointCloudXYZI::Ptr lid= meas.lid;
+        sort(lid->points.begin(), lid->points.end(), time_list);  //这里curvature中存放了时间戳（在preprocess.cpp中）
+        V3D acc_imu, vel_imu, pos_imu, angvel_avr;
+        M3D R_imu;    //IMU旋转矩阵 消除运动失真的时候用
+
+        //遍历每个IMU帧
+        auto it_pcl = lid->points.end() - 1;
+        for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
+        {
+            auto head = it_kp - 1;
+            auto tail = it_kp;
+            R_imu<<MAT_FROM_ARRAY(head->rot);   //拿到前一帧的IMU旋转矩阵
+            // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
+            vel_imu<<VEC_FROM_ARRAY(head->vel);     //拿到前一帧的IMU速度
+            pos_imu<<VEC_FROM_ARRAY(head->pos);     //拿到前一帧的IMU位置
+            acc_imu<<VEC_FROM_ARRAY(tail->acc);     //拿到后一帧的IMU加速度
+            angvel_avr<<VEC_FROM_ARRAY(tail->gyr);  //拿到后一帧的IMU角速度
+
+            //之前点云按照时间从小到大排序过，IMUpose也同样是按照时间从小到大push进入的
+            //此时从IMUpose的末尾开始循环，也就是从时间最大处开始，因此只需要判断 点云时间需>IMU head时刻  即可   不需要判断 点云时间<IMU tail
+            for(; it_pcl->curvature > head->offset_time; it_pcl --)
+            {
+                double dt = it_pcl->curvature - head->offset_time;    //点到IMU开始时刻的时间间隔 
+
+                /*    P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei)    */
+
+                M3D R_i(R_imu * Sophus::SO3::exp(angvel_avr * dt).matrix() );   //点it_pcl所在时刻的旋转：前一帧的IMU旋转矩阵 * exp(后一帧角速度*dt)   
+                
+                V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点所在时刻的位置(雷达坐标系下)
+                V3D T_ei(pos_imu + vel_imu * dt - X.pos);   //从点所在的世界位置-雷达末尾世界位置
+                V3D P_compensate = X.extrinR.matrix().transpose() * 
+                (X.rot.matrix().transpose() * (R_i * (X.extrinR.matrix() * P_i + X.extrinT) + T_ei) - X.extrinT);
+
+                it_pcl->x = P_compensate(0);
+                it_pcl->y = P_compensate(1);
+                it_pcl->z = P_compensate(2);
+
+                if (it_pcl == lid->points.begin()) break;
+            }
+        }
+
+        pclPjt = meas.lid;
+    }
+
+    void lasermap_fov_segment(V3D pos_lid)
+    {
+        cub_needrm.clear(); // 清空需要移除的区域
+
+        //初始化局部地图范围，以pos_LiD为中心,长宽高均为pa.cubeLen
+        if (!Localmap_Initialized)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                LocalMap_Points.vertex_min[i] = pos_lid(i) - pa.cubeLen / 2.0;
+                LocalMap_Points.vertex_max[i] = pos_lid(i) + pa.cubeLen / 2.0;
+            }
+            Localmap_Initialized = true;
+            return;
+        }
+
+        //各个方向上pos_LiD与局部地图边界的距离
+        float dist_to_map_edge[3][2];
+        bool need_move = false;
+        for (int i = 0; i < 3; i++)
+        {
+            dist_to_map_edge[i][0] = fabs(pos_lid(i) - LocalMap_Points.vertex_min[i]);
+            dist_to_map_edge[i][1] = fabs(pos_lid(i) - LocalMap_Points.vertex_max[i]);
+            // 与某个方向上的边界距离（1.5*300m）太小，标记需要移除need_move(FAST-LIO2论文Fig.3)
+            if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * pa.detRange || dist_to_map_edge[i][1] <= MOV_THRESHOLD * pa.detRange)
+                need_move = true;
+        }
+        if (!need_move)
+            return; //如果不需要，直接返回，不更改局部地图
+
+        BoxPointType New_LocalMap_Points, tmp_boxpoints;
+        New_LocalMap_Points = LocalMap_Points;
+        //需要移动的距离
+        float mov_dist = max((pa.cubeLen - 2.0 * MOV_THRESHOLD * pa.detRange) * 0.5 * 0.9, double(pa.detRange * (MOV_THRESHOLD - 1)));
+        for (int i = 0; i < 3; i++)
+        {
+            tmp_boxpoints = LocalMap_Points;
+            if (dist_to_map_edge[i][0] <= MOV_THRESHOLD * pa.detRange)
+            {
+                New_LocalMap_Points.vertex_max[i] -= mov_dist;
+                New_LocalMap_Points.vertex_min[i] -= mov_dist;
+                tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
+                cub_needrm.push_back(tmp_boxpoints);
+            }
+            else if (dist_to_map_edge[i][1] <= MOV_THRESHOLD * pa.detRange)
+            {
+                New_LocalMap_Points.vertex_max[i] += mov_dist;
+                New_LocalMap_Points.vertex_min[i] += mov_dist;
+                tmp_boxpoints.vertex_max[i] = LocalMap_Points.vertex_min[i] + mov_dist;
+                cub_needrm.push_back(tmp_boxpoints);
+            }
+        }
+        LocalMap_Points = New_LocalMap_Points;
+
+        PointVector points_history;
+        ikdtree.acquire_removed_points(points_history);
+
+        if (cub_needrm.size() > 0)
+            int count = ikdtree.Delete_Point_Boxes(cub_needrm); //删除指定范围内的点
+    }
+
+    void pointBodyToWorld(PointType const *const pi, PointType *const po)
+    {
+        V3D p_body(pi->x, pi->y, pi->z);
+        V3D p_global(X.rot.matrix() * (X.extrinR.matrix() * p_body + X.extrinT) + X.pos);
+
+        po->x = p_global(0);
+        po->y = p_global(1);
+        po->z = p_global(2);
+        po->intensity = pi->intensity;
+    }
+
+    void eskfUpdte(PointCloudXYZI::Ptr &lid)
+    {
+        double R = double(LASER_POINT_COV);
+
+        EskfDynData dyn_share;
+        dyn_share.valid = true;
+        dyn_share.converge = true;
+
+        int t = 0;
+        StateVal x_propagated = X; //这里的x_和P_分别是经过正向传播后的状态量和协方差矩阵，因为会先调用predict函数再调用这个函数
+        COV P_propagated = P;
+
+        StateV24 dx_new = StateV24::Zero(); // 24X1的向量
+
+        for (int i = -1; i < pa.nMaxIter; i++) // maximum_iter是卡尔曼滤波的最大迭代次数
+        {
+            dyn_share.valid = true;
+            // 计算雅克比，也就是点面残差的导数 H(代码里是h_x)
+            h_share_model(lid, dyn_share);
+
+            if (!dyn_share.valid)
+            {
+                continue;
+            }
+
+            StateV24 dx;
+            dx_new = boxminus(X, x_propagated); //公式(18)中的 x^k - x^
+
+            //由于H矩阵是稀疏的，只有前12列有非零元素，后12列是零 因此这里采用分块矩阵的形式计算 减少计算量
+            auto H = dyn_share.h_x;												// m X 12 的矩阵
+            Eigen::Matrix<double, 24, 24> HTH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 H^T * H
+            HTH.block<12, 12>(0, 0) = H.transpose() * H;
+            auto K_front = (HTH / R + P.inverse()).inverse();
+            Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> K;
+            K = K_front.block<24, 12>(0, 0) * H.transpose() / R; //卡尔曼增益  这里R视为常数
+
+            Eigen::Matrix<double, 24, 24> KH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 K * H
+            KH.block<24, 12>(0, 0) = K * H;
+            Eigen::Matrix<double, 24, 1> dx_ = K * dyn_share.h + (KH - Eigen::Matrix<double, 24, 24>::Identity()) * dx_new; //公式(18)
+            X = StatePlus(X, dx_); //公式(18)
+
+            // std::cout << "dx_: " << dx_ << std::endl;
+            // getchar();
+
+            dyn_share.converge = true;
+            for (int j = 0; j < 24; j++)
+            {
+                if (std::fabs(dx_[j]) > epsi) //如果dx>epsi 认为没有收敛
+                {
+                    dyn_share.converge = false;
+                    break;
+                }
+            }
+
+            if (dyn_share.converge)
+                t++;
+
+            if (!t && i == pa.nMaxIter - 2) //如果迭代了3次还没收敛 强制令成true，h_share_model函数中会重新寻找近邻点
+            {
+                dyn_share.converge = true;
+            }
+
+            if (t > 1 || i == pa.nMaxIter - 1)
+            {
+                P = (Eigen::Matrix<double, 24, 24>::Identity() - KH) * P; //公式(19)
+                return;
+            }
+        }
+    }
+
+    //计算每个特征点的残差及H矩阵
+    void h_share_model(PointCloudXYZI::Ptr &lid, EskfDynData &ekfom_data)
+    {
+        PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1)); //有效特征点
+        PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1)); //有效特征点对应点法相量
+	    PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));		  //特征点在地图中对应的平面参数(平面的单位法向量,以及当前点到平面距离)
+        normvec->resize(int(lid->points.size()));
+        int npts = lid->points.size();
+        laserCloudOri->clear();
+        corr_normvect->clear();
+
+#ifdef MP_EN
+        omp_set_num_threads(MP_PROC_NUM);
+#pragma omp parallel for
+#endif
+        for (int i = 0; i < npts; i++) //遍历所有的特征点
+        {
+            PointType &point_body = lid->points[i];
+            PointType point_world;
+
+            V3D p_body(point_body.x, point_body.y, point_body.z);
+            //把Lidar坐标系的点先转到IMU坐标系，再根据前向传播估计的位姿x，转到世界坐标系
+            V3D p_global(X.rot * (X.extrinR * p_body + X.extrinT) + X.pos);
+            point_world.x = p_global(0);
+            point_world.y = p_global(1);
+            point_world.z = p_global(2);
+            point_world.intensity = point_body.intensity;
+
+            vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+            auto &points_near = Nearest_Points[i]; // Nearest_Points[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
+
+            double ta = omp_get_wtime();
+            if (ekfom_data.converge)
+            {
+                //寻找point_world的最近邻的平面点
+                ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+                //判断是否是有效匹配点，与loam系列类似，要求特征点最近邻的地图点数量>阈值，距离<阈值  满足条件的才置为true
+                point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
+                                                                                                                                    : true;
+            }
+            if (!point_selected_surf[i])
+                continue; //如果该点不满足条件  不进行下面步骤
+
+            Eigen::Matrix<float, 4, 1> pabcd;		//平面点信息
+            point_selected_surf[i] = false; //将该点设置为无效点，用来判断是否满足条件
+            //拟合平面方程ax+by+cz+d=0并求解点到平面距离
+            if (esti_plane(pabcd, points_near, 0.1f))
+            {
+                float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3); //当前点到平面的距离
+                float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());												   //如果残差大于经验阈值，则认为该点是有效点  简言之，距离原点越近的lidar点  要求点到平面的距离越苛刻
+
+                if (s > 0.9) //如果残差大于阈值，则认为该点是有效点
+                {   
+                    point_selected_surf[i] = true;
+                    normvec->points[i].x = pabcd(0); //存储平面的单位法向量  以及当前点到平面距离
+                    normvec->points[i].y = pabcd(1);
+                    normvec->points[i].z = pabcd(2);
+                    normvec->points[i].intensity = pd2;
+                }
+            }
+        }
+
+        int effct_feat_num = 0; //有效特征点的数量
+        for (int i = 0; i < npts; i++)
+        {
+            if (point_selected_surf[i]) //对于满足要求的点
+            {
+                laserCloudOri->points[effct_feat_num] = lid->points[i]; //把这些点重新存到laserCloudOri中
+                corr_normvect->points[effct_feat_num] = normvec->points[i];			//存储这些点对应的法向量和到平面的距离
+                effct_feat_num++;
+            }
+        }
+
+        if (effct_feat_num < 1)
+        {
+            ekfom_data.valid = false;
+            ROS_WARN("No Effective Points! \n");
+            return;
+        }
+
+        // 雅可比矩阵H和残差向量的计算
+        ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num, 12);
+        ekfom_data.h.resize(effct_feat_num);
+
+        for (int i = 0; i < effct_feat_num; i++)
+        {
+            V3D point_(laserCloudOri->points[i].x, laserCloudOri->points[i].y, laserCloudOri->points[i].z);
+            M3D point_crossmat;
+            point_crossmat << SKEW_SYM_MATRX(point_);
+            V3D point_I_ = X.extrinR * point_ + X.extrinT;
+            M3D point_I_crossmat;
+            point_I_crossmat << SKEW_SYM_MATRX(point_I_);
+
+            // 得到对应的平面的法向量
+            const PointType &norm_p = corr_normvect->points[i];
+            V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+
+            // 计算雅可比矩阵H
+            V3D C(X.rot.matrix().transpose() * norm_vec);
+            V3D A(point_I_crossmat * C);
+            ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+
+            //残差：点面距离
+            ekfom_data.h(i) = -norm_p.intensity;
+        }
+    }
+
+    //广义减法
+    StateV24 boxminus(StateVal x1, StateVal x2)
+    {
+        StateV24 x_r = StateV24::Zero();
+
+        x_r.block<3, 1>(0, 0) = x1.pos - x2.pos;
+
+        x_r.block<3, 1>(3, 0) = Sophus::SO3(x2.rot.matrix().transpose() * x1.rot.matrix()).log();
+        x_r.block<3, 1>(6, 0) = Sophus::SO3(x2.extrinR.matrix().transpose() * x1.extrinR.matrix()).log();
+
+        x_r.block<3, 1>(9, 0) = x1.extrinT - x2.extrinT;
+        x_r.block<3, 1>(12, 0) = x1.vel - x2.vel;
+        x_r.block<3, 1>(15, 0) = x1.bg - x2.bg;
+        x_r.block<3, 1>(18, 0) = x1.ba - x2.ba;
+        x_r.block<3, 1>(21, 0) = x1.grav - x2.grav;
+
+        return x_r;
+    }
+
+    void map_incremental(PointCloudXYZI::Ptr &lid)
+    {
+        PointVector PointToAdd;
+        PointVector PointNoNeedDownsample;
+        int npts = lid->points.size();
+        PointToAdd.reserve(npts);
+        PointNoNeedDownsample.reserve(npts);
+        for (int i = 0; i < npts; i++)
+        {
+            if (!Nearest_Points[i].empty())
+            {
+                //cerr << 0;
+                const PointVector &points_near = Nearest_Points[i];
+                bool need_add = true;
+                BoxPointType Box_of_Point;
+                PointType mid_point; //点所在体素的中心
+                mid_point.x = floor(lid->points[i].x / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
+                mid_point.y = floor(lid->points[i].y / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
+                mid_point.z = floor(lid->points[i].z / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
+                float dist = calc_dist(lid->points[i], mid_point);
+                if (fabs(points_near[0].x - mid_point.x) > 0.5 * pa.minMapFilterSize 
+                && fabs(points_near[0].y - mid_point.y) > 0.5 * pa.minMapFilterSize 
+                && fabs(points_near[0].z - mid_point.z) > 0.5 * pa.minMapFilterSize)
+                {
+                    PointNoNeedDownsample.push_back(lid->points[i]); //如果距离最近的点都在体素外，则该点不需要Downsample
+                    continue;
+                }
+                for (int j = 0; j < NUM_MATCH_POINTS; j++)
+                {
+                    if (points_near.size() < NUM_MATCH_POINTS)
+                        break;
+                    if (calc_dist(points_near[j], mid_point) < dist) //如果近邻点距离 < 当前点距离，不添加该点
+                    {
+                        need_add = false;
+                        break;
+                    }
+                }
+                if (need_add)
+                {
+                    //cerr << 1;
+                    PointToAdd.push_back(lid->points[i]);
+                }
+                else
+                {
+                    //cerr << 2;
+                }
+            }
+            else
+            {
+                PointToAdd.push_back(lid->points[i]);
+            }
+        }
+
+        double st_time = omp_get_wtime();
+        int add_point_size = ikdtree.Add_Points(PointToAdd, true);
+        ikdtree.Add_Points(PointNoNeedDownsample, false);
+        add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
+    }   
+
+    template<typename T>
+    bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold)
+    {
+        Eigen::Matrix<T, NUM_MATCH_POINTS, 3> A;
+        Eigen::Matrix<T, NUM_MATCH_POINTS, 1> b;
+        A.setZero();
+        b.setOnes();
+        b *= -1.0f;
+
+        //求A/Dx + B/Dy + C/Dz + 1 = 0 的参数 
+        for (int j = 0; j < NUM_MATCH_POINTS; j++)
+        {
+            A(j,0) = point[j].x;
+            A(j,1) = point[j].y;
+            A(j,2) = point[j].z;
+        }
+
+        Eigen::Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
+
+        T n = normvec.norm();
+        //pca_result是平面方程的4个参数  /n是为了归一化
+        pca_result(0) = normvec(0) / n;
+        pca_result(1) = normvec(1) / n;
+        pca_result(2) = normvec(2) / n;
+        pca_result(3) = 1.0 / n;
+
+        //如果几个点中有距离该平面>threshold的点 认为是不好的平面 返回false
+        for (int j = 0; j < NUM_MATCH_POINTS; j++)
+        {
+            if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    float calc_dist(PointType p1, PointType p2)
+    {
+        float d = (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) + (p1.z - p2.z) * (p1.z - p2.z);
+        return d;
+    }
+
+    void publishPath()
+    {
+        geometry_msgs::PoseStamped poseMsg;
+        poseMsg.pose = convert2ROSPose(X.rot, X.pos);
+        poseMsg.header.stamp = ros::Time().fromSec(curTime);
+        poseMsg.header.frame_id = "camera_init";
+
+        /*** if path is too large, the rvis will crash ***/
+        static int jjj = 0;
+        jjj++;
+        if (jjj % 10 == 0)
+        {
+            path.poses.push_back(poseMsg);
+            pubPath.publish(path);
+        }
+    }
+
+    void publishCurPcl()
+    {
+        sensor_msgs::PointCloud2 lidMsg;
+        pcl::toROSMsg(*pclPjtDownWorld, lidMsg);
+        lidMsg.header.stamp = ros::Time().fromSec(curTime);
+        lidMsg.header.frame_id = "camera_init";
+        pubCurPcl.publish(lidMsg);
+    }
+
+    void publishMap()
+    {
+        PointCloudXYZI::Ptr mapPcl(new PointCloudXYZI());
+        PointVector().swap(ikdtree.PCL_Storage);
+        ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+        mapPcl->clear();
+        mapPcl->points = ikdtree.PCL_Storage;
+
+        sensor_msgs::PointCloud2 mapPclMsg;
+        pcl::toROSMsg(*mapPcl, mapPclMsg);
+        mapPclMsg.header.stamp = ros::Time().fromSec(curTime);
+        mapPclMsg.header.frame_id = "camera_init";
+        pubMap.publish(mapPclMsg);
+    }   
+
+    void savePcdMap()
+    {
+        
+    }
+
+};
+
+int main(int argc, char** argv)
+{
+    ros::init(argc, argv, "ww_lio");
+
+    LaserMapping LP;
+    
+    thread loopthread(&LaserMapping::processThread, &LP);
+
+    ros::spin();
+    
+    return 0;
+}
