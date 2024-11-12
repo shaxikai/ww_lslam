@@ -1,5 +1,6 @@
 #include <iomanip> 
 #include <vector>
+#include <array>
 #include <deque>
 #include <thread>
 
@@ -24,8 +25,6 @@
 #include <pcl/io/pcd_io.h>
 
 #include <livox_ros_driver/CustomMsg.h>
-
-#include <ww_lslam/Pose6D.h>
 
 #include "ikd-Tree/ikd_Tree.h"
 

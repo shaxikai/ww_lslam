@@ -4,6 +4,8 @@ common:
     lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
     scan_line: 4
     blind: 4
+    det_range: 450.0
+    fov_degree: 90
  
 mapping:
     acc_cov: 0.1
@@ -11,8 +13,6 @@ mapping:
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
     lid_point_cov: 0.001
-    fov_degree:    90
-    det_range:     450.0
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
     extrinsic_T: [ 0.04165, 0.02326, -0.0284 ]
     extrinsic_R: [ 1, 0, 0,
