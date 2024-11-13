@@ -5,9 +5,6 @@
 
 using namespace std;
 
-
-bool point_selected_surf[100000] = {1};							  //判断是否是有效特征点
-
 //判断点的时间先后顺序(注意curvature中存储的是时间戳)
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
@@ -98,7 +95,7 @@ private:
         Sophus::SO3 rot = Sophus::SO3(Eigen::Matrix3d::Identity());
     };
 
-    struct  StateVal
+    struct StateVal
     {
         Eigen::Vector3d pos = Eigen::Vector3d(0,0,0);
         Sophus::SO3 rot = Sophus::SO3(Eigen::Matrix3d::Identity());
@@ -113,7 +110,8 @@ private:
     struct EskfDynData
     {
         bool valid;												   //有效特征点数量是否满足要求
-        bool converge;											   //迭代时，是否已经收敛            
+        bool converge;											   //迭代时，是否已经收敛     
+        array<bool, MAX_NUM_SIG_LID> validPtsFlag;	       
         Eigen::Matrix<double, Eigen::Dynamic, 1> h;				   //残差	(公式(14)中的z)
         Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> h_x; //雅可比矩阵H (公式(14)中的H)
     };
@@ -141,10 +139,6 @@ private:
     bool imuInited;
     V3D mean_acc;                           //加速度均值,用于计算方差
     V3D mean_gyr;                           //角速度均值，用于计算方差
-    V3D cov_acc;             //加速度协方差
-    V3D cov_gyr;             //角速度协方差
-    V3D cov_acc_b;             //加速度协方差
-    V3D cov_gyr_b;             //角速度协方差
     Eigen::Matrix<double, 12, 12> Q;
 
     StateVal X;
@@ -198,10 +192,6 @@ public:
     void reset()
     {
         imuInited = false;
-        cov_gyr = V3D(pa.gyrCov, pa.gyrCov, pa.gyrCov);
-        cov_acc = V3D(pa.accCov, pa.accCov, pa.accCov);
-        cov_gyr_b = V3D(pa.bGyrCov, pa.bGyrCov, pa.bGyrCov);
-        cov_acc_b = V3D(pa.bAccCov, pa.bAccCov, pa.bAccCov);
 
         Q = Eigen::MatrixXd::Zero(12, 12);            
         Q.block<3, 3>(0, 0).diagonal() = V3D(pa.gyrCov, pa.gyrCov, pa.gyrCov);
@@ -377,8 +367,6 @@ public:
         /*** iterated state estimation ***/
         Nearest_Points.resize(npts); //存储近邻点的vector
         eskfUpdte(pclPjtDown);
-
-        lidPos = X.pos + X.rot.matrix() * X.extrinT;
 
         /*** add the feature points to map kdtree ***/
         pclPjtDownWorld->resize(npts);
@@ -627,6 +615,7 @@ public:
                 if (it_pcl == lid->points.begin()) break;
             }
         }
+        std::cerr << it_pcl->curvature << " " << (lid->points.begin())->curvature << std::endl;
 
         pclPjt = meas.lid;
     }
@@ -705,32 +694,28 @@ public:
 
     void eskfUpdte(PointCloudXYZI::Ptr &lid)
     {
-        EskfDynData dyn_share;
-        dyn_share.valid = true;
-        dyn_share.converge = true;
+        EskfDynData eskfData;
+        eskfData.valid = true;
+        eskfData.converge = true;
 
-        int t = 0;
+        int convergeCnt = 0;
         StateVal x_propagated = X; //这里的x_和P_分别是经过正向传播后的状态量和协方差矩阵，因为会先调用predict函数再调用这个函数
         COV P_propagated = P;
-
         StateV24 dx_new = StateV24::Zero(); // 24X1的向量
-
         for (int i = -1; i < pa.nMaxIter; i++) // maximum_iter是卡尔曼滤波的最大迭代次数
         {
-            dyn_share.valid = true;
             // 计算雅克比，也就是点面残差的导数 H(代码里是h_x)
-            h_share_model(lid, dyn_share);
+            eskfData.valid = true;
+            h_share_model(lid, eskfData);
 
-            if (!dyn_share.valid)
-            {
-                continue;
-            }
+            // 没有有效的近邻点
+            if (!eskfData.valid) return;
 
             StateV24 dx;
             dx_new = boxminus(X, x_propagated); //公式(18)中的 x^k - x^
 
             //由于H矩阵是稀疏的，只有前12列有非零元素，后12列是零 因此这里采用分块矩阵的形式计算 减少计算量
-            auto H = dyn_share.h_x;												// m X 12 的矩阵
+            auto H = eskfData.h_x;												// m X 12 的矩阵
             Eigen::Matrix<double, 24, 24> HTH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 H^T * H
             HTH.block<12, 12>(0, 0) = H.transpose() * H;
             auto K_front = (HTH / pa.lidPtCov + P.inverse()).inverse();
@@ -739,31 +724,30 @@ public:
 
             Eigen::Matrix<double, 24, 24> KH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 K * H
             KH.block<24, 12>(0, 0) = K * H;
-            Eigen::Matrix<double, 24, 1> dx_ = K * dyn_share.h + (KH - Eigen::Matrix<double, 24, 24>::Identity()) * dx_new; //公式(18)
+            Eigen::Matrix<double, 24, 1> dx_ = K * eskfData.h + (KH - Eigen::Matrix<double, 24, 24>::Identity()) * dx_new; //公式(18)
             X = StatePlus(X, dx_); //公式(18)
 
             // std::cout << "dx_: " << dx_ << std::endl;
             // getchar();
 
-            dyn_share.converge = true;
             for (int j = 0; j < 24; j++)
             {
                 if (std::fabs(dx_[j]) > pa.epsi) //如果dx>epsi 认为没有收敛
                 {
-                    dyn_share.converge = false;
+                    eskfData.converge = false;
                     break;
                 }
             }
 
-            if (dyn_share.converge)
-                t++;
+            if (eskfData.converge)
+                convergeCnt++;
 
-            if (!t && i == pa.nMaxIter - 2) //如果迭代了3次还没收敛 强制令成true，h_share_model函数中会重新寻找近邻点
+            if (0 == convergeCnt && i == pa.nMaxIter - 2) //如果迭代了3次还没收敛 强制令成true，h_share_model函数中会重新寻找近邻点
             {
-                dyn_share.converge = true;
+                eskfData.converge = true;
             }
 
-            if (t > 1 || i == pa.nMaxIter - 1)
+            if (convergeCnt > 1 || i == pa.nMaxIter - 1)
             {
                 P = (Eigen::Matrix<double, 24, 24>::Identity() - KH) * P; //公式(19)
                 return;
@@ -772,20 +756,22 @@ public:
     }
 
     //计算每个特征点的残差及H矩阵
-    void h_share_model(PointCloudXYZI::Ptr &lid, EskfDynData &ekfom_data)
+    void h_share_model(PointCloudXYZI::Ptr &lid, EskfDynData &eskfData)
     {
-        PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1)); //有效特征点
-        PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1)); //有效特征点对应点法相量
-	    PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));		  //特征点在地图中对应的平面参数(平面的单位法向量,以及当前点到平面距离)
-        normvec->resize(int(lid->points.size()));
+        array<bool, MAX_NUM_SIG_LID> &validPtsFlag = eskfData.validPtsFlag;
+        
+        PointCloudXYZI::Ptr validPts(new PointCloudXYZI(MAX_NUM_SIG_LID, 1));  //有效特征点
+	    PointCloudXYZI::Ptr norms(new PointCloudXYZI(MAX_NUM_SIG_LID, 1));	   //特征点在地图中对应的平面参数(平面的单位法向量,以及当前点到平面距离)
         int npts = lid->points.size();
-        laserCloudOri->clear();
-        corr_normvect->clear();
+        validPts->resize(npts);
+        norms->resize(npts);
 
-#ifdef MP_EN
-        omp_set_num_threads(MP_PROC_NUM);
-#pragma omp parallel for
-#endif
+// #ifdef MP_EN
+//         omp_set_num_threads(MP_PROC_NUM);
+// #pragma omp parallel for
+// #endif
+        
+        int nValid = 0; //有效特征点的数量
         for (int i = 0; i < npts; i++) //遍历所有的特征点
         {
             PointType &point_body = lid->points[i];
@@ -802,79 +788,73 @@ public:
             vector<float> pointSearchSqDis(NUM_MATCH_POINT);
             auto &points_near = Nearest_Points[i]; // Nearest_Points[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
 
-            double ta = omp_get_wtime();
-            if (ekfom_data.converge)
+            if (eskfData.converge)
             {
                 //寻找point_world的最近邻的平面点
                 ikdtree.Nearest_Search(point_world, NUM_MATCH_POINT, points_near, pointSearchSqDis);
                 //判断是否是有效匹配点，与loam系列类似，要求特征点最近邻的地图点数量>阈值，距离<阈值  满足条件的才置为true
-                point_selected_surf[i] = points_near.size() < NUM_MATCH_POINT ? false : pointSearchSqDis[NUM_MATCH_POINT - 1] > 5 ? false
-                                                                                                                                    : true;
-            }
-            if (!point_selected_surf[i])
-                continue; //如果该点不满足条件  不进行下面步骤
+                validPtsFlag[i] = points_near.size() < NUM_MATCH_POINT ? 
+                false : pointSearchSqDis[NUM_MATCH_POINT - 1] > 5 ? false : true;
 
-            Eigen::Matrix<float, 4, 1> pabcd;		//平面点信息
-            point_selected_surf[i] = false; //将该点设置为无效点，用来判断是否满足条件
+            }
+            
+            if (!validPtsFlag[i])
+                continue;
+
             //拟合平面方程ax+by+cz+d=0并求解点到平面距离
-            if (esti_plane(pabcd, points_near, 0.1f))
+            array<double, 4> pabcd;		//平面点信息
+            if (estiPlane(pabcd, points_near, 0.1f))
             {
-                float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3); //当前点到平面的距离
+                float pd2 = pabcd[0] * point_world.x + pabcd[1] * point_world.y + pabcd[2] * point_world.z + pabcd[3]; //当前点到平面的距离
                 float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());												   //如果残差大于经验阈值，则认为该点是有效点  简言之，距离原点越近的lidar点  要求点到平面的距离越苛刻
 
                 if (s > 0.9) //如果残差大于阈值，则认为该点是有效点
                 {   
-                    point_selected_surf[i] = true;
-                    normvec->points[i].x = pabcd(0); //存储平面的单位法向量  以及当前点到平面距离
-                    normvec->points[i].y = pabcd(1);
-                    normvec->points[i].z = pabcd(2);
-                    normvec->points[i].intensity = pd2;
+                    validPtsFlag[i] = true;
+                    validPts->points[nValid] = lid->points[i];
+                    norms->points[nValid].x = pabcd[0]; //存储平面的单位法向量  以及当前点到平面距离
+                    norms->points[nValid].y = pabcd[1];
+                    norms->points[nValid].z = pabcd[2];
+                    norms->points[nValid].intensity = pd2;
+                    nValid++;
+                }
+                else
+                {
+                    validPtsFlag[i] = false;
                 }
             }
         }
 
-        int effct_feat_num = 0; //有效特征点的数量
-        for (int i = 0; i < npts; i++)
+        if (nValid < 10)
         {
-            if (point_selected_surf[i]) //对于满足要求的点
-            {
-                laserCloudOri->points[effct_feat_num] = lid->points[i]; //把这些点重新存到laserCloudOri中
-                corr_normvect->points[effct_feat_num] = normvec->points[i];			//存储这些点对应的法向量和到平面的距离
-                effct_feat_num++;
-            }
-        }
-
-        if (effct_feat_num < 1)
-        {
-            ekfom_data.valid = false;
+            eskfData.valid = false;
             ROS_WARN("No Effective Points! \n");
             return;
         }
 
         // 雅可比矩阵H和残差向量的计算
-        ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_feat_num, 12);
-        ekfom_data.h.resize(effct_feat_num);
-
-        for (int i = 0; i < effct_feat_num; i++)
+        eskfData.h_x = Eigen::MatrixXd::Zero(nValid, 12);
+        eskfData.h.resize(nValid);
+        for (int i = 0; i < nValid; i++)
         {
-            V3D point_(laserCloudOri->points[i].x, laserCloudOri->points[i].y, laserCloudOri->points[i].z);
+            V3D pt(validPts->points[i].x, validPts->points[i].y, validPts->points[i].z);
             M3D point_crossmat;
-            point_crossmat << SKEW_SYM_MATRX(point_);
-            V3D point_I_ = X.extrinR * point_ + X.extrinT;
+            point_crossmat << SKEW_SYM_MATRX(pt);
+            V3D point_I_ = X.extrinR * pt + X.extrinT;
             M3D point_I_crossmat;
             point_I_crossmat << SKEW_SYM_MATRX(point_I_);
 
             // 得到对应的平面的法向量
-            const PointType &norm_p = corr_normvect->points[i];
+            const PointType &norm_p = norms->points[i];
             V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
 
             // 计算雅可比矩阵H
             V3D C(X.rot.matrix().transpose() * norm_vec);
             V3D A(point_I_crossmat * C);
-            ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+            eskfData.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 
             //残差：点面距离
-            ekfom_data.h(i) = -norm_p.intensity;
+            eskfData.h(i) = -norm_p.intensity;
         }
     }
 
@@ -956,11 +936,10 @@ public:
         add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     }   
 
-    template<typename T>
-    bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold)
+    bool estiPlane(array<double, 4> &pca_result, const PointVector &point, const double &threshold)
     {
-        Eigen::Matrix<T, NUM_MATCH_POINT, 3> A;
-        Eigen::Matrix<T, NUM_MATCH_POINT, 1> b;
+        Eigen::Matrix<double, NUM_MATCH_POINT, 3> A;
+        Eigen::Matrix<double, NUM_MATCH_POINT, 1> b;
         A.setZero();
         b.setOnes();
         b *= -1.0f;
@@ -973,19 +952,19 @@ public:
             A(j,2) = point[j].z;
         }
 
-        Eigen::Matrix<T, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
+        Eigen::Matrix<double, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
 
-        T n = normvec.norm();
+        double n = normvec.norm();
         //pca_result是平面方程的4个参数  /n是为了归一化
-        pca_result(0) = normvec(0) / n;
-        pca_result(1) = normvec(1) / n;
-        pca_result(2) = normvec(2) / n;
-        pca_result(3) = 1.0 / n;
+        pca_result[0] = normvec(0) / n;
+        pca_result[1] = normvec(1) / n;
+        pca_result[2] = normvec(2) / n;
+        pca_result[3] = 1.0 / n;
 
         //如果几个点中有距离该平面>threshold的点 认为是不好的平面 返回false
         for (int j = 0; j < NUM_MATCH_POINT; j++)
         {
-            if (fabs(pca_result(0) * point[j].x + pca_result(1) * point[j].y + pca_result(2) * point[j].z + pca_result(3)) > threshold)
+            if (fabs(pca_result[0] * point[j].x + pca_result[1] * point[j].y + pca_result[2] * point[j].z + pca_result[3]) > threshold)
             {
                 return false;
             }

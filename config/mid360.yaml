@@ -2,7 +2,7 @@ common:
     lid_topic:  "/livox/lidar"
     imu_topic:  "/livox/imu"
     lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
-    scan_line: 6
+    scan_line: 4
     blind: 4
     det_range: 450.0
     fov_degree: 90
