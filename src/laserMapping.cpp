@@ -20,13 +20,13 @@ private:
 
         bool    enPathPub;
         bool    enCurPclPub;
+        bool    enDenPclPub;
         bool    enMapPub;
-        bool    enDenMapPub;
 
         string  pathTopic;
         string  curPclTopic;
+        string  denPclTopic;
         string  mapTopic;
-        string  denMapTopic;
 
         string  worldCoord;
 
@@ -90,7 +90,10 @@ private:
 
     struct PjtData
     {
-        double offt;
+        double offt;        
+        V3D acc = Eigen::Vector3d(0,0,0);
+        V3D gyr = Eigen::Vector3d(0,0,0);
+        V3D vel = Eigen::Vector3d(0,0,0);
         Eigen::Vector3d pos = Eigen::Vector3d(0,0,0);
         Sophus::SO3 rot = Sophus::SO3(Eigen::Matrix3d::Identity());
     };
@@ -124,12 +127,12 @@ private:
 
     ros::Publisher  pubPath;
     ros::Publisher  pubCurPcl;
+    ros::Publisher  pubDenPcl;
     ros::Publisher  pubMap;
-    ros::Publisher  pubDenMap;
 
     double curTime;
 
-    std::deque<double> timeBuffer;
+    std::deque<double> timeBuffer;     // 单位 s
     std::deque<PointCloudXYZI::Ptr> lidBuffer;
     std::deque<sensor_msgs::Imu::ConstPtr> imuBuffer;
 
@@ -151,7 +154,7 @@ private:
     vector<BoxPointType> cub_needrm;
     BoxPointType LocalMap_Points;      // ikd-tree地图立方体的2个角点
     bool Localmap_Initialized = false; // 局部地图是否初始化
-    vector<PointVector> Nearest_Points;
+    vector<PointVector> nearPclPts;
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
     pcl::VoxelGrid<PointType> downSizeFilterMap;
 
@@ -178,14 +181,17 @@ public:
             subLid = nh.subscribe<livox_ros_driver::CustomMsg>(
                      pa.lidTopic, 5, &LaserMapping::livoxLidHandler, this, ros::TransportHints().tcpNoDelay());
             break;
+        case RS32:
+            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
+                     pa.lidTopic, 5, &LaserMapping::rsLidHandler, this, ros::TransportHints().tcpNoDelay());
         default:
             break;
         }
 
         pubPath     = nh.advertise<nav_msgs::Path>(pa.pathTopic, 100000);
         pubCurPcl   = nh.advertise<sensor_msgs::PointCloud2>(pa.curPclTopic, 100000);
+        pubDenPcl   = nh.advertise<sensor_msgs::PointCloud2>(pa.denPclTopic, 100000);
         pubMap      = nh.advertise<sensor_msgs::PointCloud2>(pa.mapTopic, 100000);
-        pubDenMap   = nh.advertise<sensor_msgs::PointCloud2>(pa.denMapTopic, 100000);
 
     }
 
@@ -234,13 +240,13 @@ public:
 
         nh.param<bool>("publish/path_pub_en", pa.enPathPub, true);
         nh.param<bool>("publish/cur_pcl_pub_en", pa.enCurPclPub, true);
+        nh.param<bool>("publish/den_pcl_pub_en", pa.enDenPclPub, true);
         nh.param<bool>("publish/map_pub_en", pa.enMapPub, true);
-        nh.param<bool>("publish/dense_map_pub_en", pa.enDenMapPub, true);
 
         nh.param<string>("publish/path_topic", pa.pathTopic, "/path");
         nh.param<string>("publish/cur_pcl_topic", pa.curPclTopic, "/cur_pcl");
+        nh.param<string>("publish/den_pcl_topic", pa.denPclTopic, "/den_pcl");
         nh.param<string>("publish/map_topic", pa.mapTopic, "/map");
-        nh.param<string>("publish/dense_map_topic", pa.denMapTopic, "/dense_map");
 
         nh.param<int>("common/lidar_type", pa.lidType, AVIA); // 激光雷达的类型
         nh.param<double>("common/blind", pa.blind, 0.01);        // 最小距离阈值，即过滤掉0～blind范围内的点云
@@ -306,6 +312,39 @@ public:
         //cerr <<"in " << lidBuffer.size();
     }
 
+    void rsLidHandler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+    {
+        pcl::PointCloud<rslidar_ros::Point> rsPts;
+        pcl::fromROSMsg(*msg, rsPts);
+        int nPts = rsPts.points.size();
+
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        PointType pt, lastPt;
+        uint gap = pa.nPointFilter;
+        for (uint i = 0; i < nPts; i+=gap)
+        {
+            if (rsPts.points[i].ring < pa.N_SCANS)
+            {
+                pt.x = rsPts.points[i].x;
+                pt.y = rsPts.points[i].y;
+                pt.z = rsPts.points[i].z;
+                pt.intensity = rsPts.points[i].intensity;
+                pt.curvature = rsPts.points[i].timestamp - rsPts.points[0].timestamp; 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock1(lidLock);
+        lidBuffer.push_back(pclPtr);
+        timeBuffer.push_back(msg->header.stamp.toSec());
+    }
+
     void imuHandler(const sensor_msgs::Imu::ConstPtr &msg)
     {
         std::lock_guard<std::mutex> lock1(imuLock);
@@ -343,7 +382,7 @@ public:
         projectPcl(measDate, pjtData, pclPjt);
 
         V3D lidPos = X.pos + X.rot.matrix() * X.extrinT;
-        cerr << "lid pose: " << lidPos(0) << " " << lidPos(1) << " " << lidPos(2) << endl;
+        cerr << "prei pose : " << X.pos(0) << " " << X.pos(1) << " " << X.pos(2) << endl;
         lasermap_fov_segment(lidPos);
 
         //点云下采样
@@ -352,10 +391,7 @@ public:
         int npts  = pclPjtDown->points.size();
 
         pclPjtDownWorld->resize(npts);
-        for (int i = 0; i < npts; i++)
-        {
-            pointBodyToWorld(&(pclPjtDown->points[i]), &(pclPjtDownWorld->points[i])); // lidar坐标系转到世界坐标系
-        }
+        ptsBody2World(pclPjtDown, pclPjtDownWorld);
 
         //初始化ikdtree(ikdtree为空时)
         if (ikdtree.Root_Node == nullptr)
@@ -365,11 +401,12 @@ public:
         }
 
         /*** iterated state estimation ***/
-        Nearest_Points.resize(npts); //存储近邻点的vector
+        nearPclPts.resize(npts);
         eskfUpdte(pclPjtDown);
+        cerr << "eskf pose : " << X.pos(0) << " " << X.pos(1) << " " << X.pos(2) << endl;
 
         /*** add the feature points to map kdtree ***/
-        pclPjtDownWorld->resize(npts);
+        nearPclPts.resize(npts);
         map_incremental(pclPjtDownWorld);
 
         publishStatus();
@@ -386,6 +423,12 @@ public:
         PointCloudXYZI::Ptr lid = lidBuffer.front();
         double lidBigTime = timeBuffer.front();
         double lidEndTime = lidBigTime + lid->points.back().curvature;
+
+        // std::cerr << std::setprecision(15) 
+        // << lidBuffer.size() << " "
+        // << lidBigTime << " " << lidEndTime << " " 
+        // << imuBuffer.front()->header.stamp.toSec() << " "
+        // << endl;
 
         // 要求imu数据包含激光数据，否则不往下处理了
         if (imuBuffer.front()->header.stamp.toSec() > lidBigTime)
@@ -539,7 +582,7 @@ public:
         pjtData.clear();
         V3D _acc = V3D(0., 0., 0.);               //加速度协方差初始化
         V3D _gyr = V3D(0., 0., 0.);               //角速度协方差初始化
-        pjtData.push_back({0.0, X.pos, X.rot});
+        pjtData.push_back({0.0, _acc, _gyr, X.vel, X.pos, X.rot});
 
         double dt = 0;
         ImuData in;
@@ -573,11 +616,12 @@ public:
             imuUnitPreint(dt, Q, in);
 
             double &&offt = tail->header.stamp.toSec() - pcl_beg_time;    //后一个IMU时刻距离此次雷达开始的时间间隔
-            pjtData.push_back({offt, X.pos, X.rot});
+            pjtData.push_back({offt, _acc, _gyr, X.vel, X.pos, X.rot});
         }
 
         dt = abs(meas.lidEndTime - v_imu.back()->header.stamp.toSec());
         imuUnitPreint(dt, Q, in);
+
     }
 
     void projectPcl(const MeasureGroup &meas, vector<PjtData> &pjtData, PointCloudXYZI::Ptr &pclPjt)
@@ -586,27 +630,63 @@ public:
         PointCloudXYZI::Ptr lid= meas.lid;
         sort(lid->points.begin(), lid->points.end(), time_list);  //这里curvature中存放了时间戳（在preprocess.cpp中）
 
+        // //遍历每个IMU帧
+        // auto it_pcl = lid->points.end() - 1;
+        // for (auto it_kp = pjtData.end() - 1; it_kp != pjtData.begin(); it_kp--)
+        // {
+        //     auto head = it_kp - 1;
+        //     auto tail = it_kp;
+
+        //     //之前点云按照时间从小到大排序过，IMUpose也同样是按照时间从小到大push进入的
+        //     //此时从IMUpose的末尾开始循环，也就是从时间最大处开始，因此只需要判断 点云时间需>IMU head时刻  即可   不需要判断 点云时间<IMU tail
+        //     for(; it_pcl->curvature > head->offt; it_pcl --)
+        //     {
+        //         double a1 = (it_pcl->curvature - head->offt) / (tail->offt - head->offt);
+        //         double a2 = 1.0 - a1;
+
+        //         M3D rot_imu = a2 * head->rot.matrix() + a1 * tail->rot.matrix();
+        //         V3D pos_imu = a2 * head->pos + a1 * tail->pos;
+            
+        //         V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点所在时刻的位置(雷达坐标系下)
+        //         V3D T_ei(pos_imu - X.pos);   //从点所在的世界位置-雷达末尾世界位置
+        //         V3D P_compensate = X.extrinR.matrix().transpose() * 
+        //         (X.rot.matrix().transpose() * (rot_imu * (X.extrinR.matrix() * P_i + X.extrinT) + T_ei) - X.extrinT);
+
+        //         it_pcl->x = P_compensate(0);
+        //         it_pcl->y = P_compensate(1);
+        //         it_pcl->z = P_compensate(2);
+
+        //         if (it_pcl == lid->points.begin()) break;
+        //     }
+        // }
+
         //遍历每个IMU帧
         auto it_pcl = lid->points.end() - 1;
         for (auto it_kp = pjtData.end() - 1; it_kp != pjtData.begin(); it_kp--)
         {
             auto head = it_kp - 1;
             auto tail = it_kp;
+            M3D R_imu = head->rot.matrix();   //拿到前一帧的IMU旋转矩阵
+            // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
+            V3D vel_imu=head->vel;     //拿到前一帧的IMU速度
+            V3D pos_imu=head->pos;     //拿到前一帧的IMU位置
+            V3D acc_imu=tail->acc;     //拿到后一帧的IMU加速度
+            V3D angvel_avr=tail->gyr;  //拿到后一帧的IMU角速度
 
             //之前点云按照时间从小到大排序过，IMUpose也同样是按照时间从小到大push进入的
             //此时从IMUpose的末尾开始循环，也就是从时间最大处开始，因此只需要判断 点云时间需>IMU head时刻  即可   不需要判断 点云时间<IMU tail
             for(; it_pcl->curvature > head->offt; it_pcl --)
             {
-                double a1 = (it_pcl->curvature - head->offt) / (tail->offt - head->offt);
-                double a2 = 1.0 - a1;
+                double dt = it_pcl->curvature - head->offt;    //点到IMU开始时刻的时间间隔 
 
-                M3D rot_imu = a2 * head->rot.matrix() + a1 * tail->rot.matrix();
-                V3D pos_imu = a2 * head->pos + a1 * tail->pos;
-            
+                /*    P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei)    */
+
+                M3D R_i(R_imu * Sophus::SO3::exp(angvel_avr * dt).matrix() );   //点it_pcl所在时刻的旋转：前一帧的IMU旋转矩阵 * exp(后一帧角速度*dt)   
+                
                 V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点所在时刻的位置(雷达坐标系下)
-                V3D T_ei(pos_imu - X.pos);   //从点所在的世界位置-雷达末尾世界位置
+                V3D T_ei(pos_imu + vel_imu * dt - X.pos);   //从点所在的世界位置-雷达末尾世界位置
                 V3D P_compensate = X.extrinR.matrix().transpose() * 
-                (X.rot.matrix().transpose() * (rot_imu * (X.extrinR.matrix() * P_i + X.extrinT) + T_ei) - X.extrinT);
+                (X.rot.matrix().transpose() * (R_i * (X.extrinR.matrix() * P_i + X.extrinT) + T_ei) - X.extrinT);
 
                 it_pcl->x = P_compensate(0);
                 it_pcl->y = P_compensate(1);
@@ -615,7 +695,6 @@ public:
                 if (it_pcl == lid->points.begin()) break;
             }
         }
-        std::cerr << it_pcl->curvature << " " << (lid->points.begin())->curvature << std::endl;
 
         pclPjt = meas.lid;
     }
@@ -681,7 +760,7 @@ public:
             int count = ikdtree.Delete_Point_Boxes(cub_needrm); //删除指定范围内的点
     }
 
-    void pointBodyToWorld(PointType const *const pi, PointType *const po)
+    void ptBody2World(PointType const *const pi, PointType *const po)
     {
         V3D p_body(pi->x, pi->y, pi->z);
         V3D p_global(X.rot.matrix() * (X.extrinR.matrix() * p_body + X.extrinT) + X.pos);
@@ -690,6 +769,16 @@ public:
         po->y = p_global(1);
         po->z = p_global(2);
         po->intensity = pi->intensity;
+    }
+
+    void ptsBody2World(PointCloudXYZI::Ptr &pclBody, PointCloudXYZI::Ptr &pclWorld)
+    {
+        int npts = pclBody->points.size();
+        pclWorld->resize(npts);
+        for (int i = 0; i < npts; i++)
+        {
+            ptBody2World(&(pclBody->points[i]), &(pclWorld->points[i])); // lidar坐标系转到世界坐标系
+        }
     }
 
     void eskfUpdte(PointCloudXYZI::Ptr &lid)
@@ -727,8 +816,8 @@ public:
             Eigen::Matrix<double, 24, 1> dx_ = K * eskfData.h + (KH - Eigen::Matrix<double, 24, 24>::Identity()) * dx_new; //公式(18)
             X = StatePlus(X, dx_); //公式(18)
 
-            // std::cout << "dx_: " << dx_ << std::endl;
-            // getchar();
+            //std::cout << "dx_: " << dx_[0] << " " << dx_[1] << " " << dx_[2] << std::endl;
+            //getchar();
 
             for (int j = 0; j < 24; j++)
             {
@@ -758,11 +847,11 @@ public:
     //计算每个特征点的残差及H矩阵
     void h_share_model(PointCloudXYZI::Ptr &lid, EskfDynData &eskfData)
     {
-        array<bool, MAX_NUM_SIG_LID> &validPtsFlag = eskfData.validPtsFlag;
-        
+        auto &validPtsFlag = eskfData.validPtsFlag;
+        int npts = lid->points.size();
+
         PointCloudXYZI::Ptr validPts(new PointCloudXYZI(MAX_NUM_SIG_LID, 1));  //有效特征点
 	    PointCloudXYZI::Ptr norms(new PointCloudXYZI(MAX_NUM_SIG_LID, 1));	   //特征点在地图中对应的平面参数(平面的单位法向量,以及当前点到平面距离)
-        int npts = lid->points.size();
         validPts->resize(npts);
         norms->resize(npts);
 
@@ -786,7 +875,7 @@ public:
             point_world.intensity = point_body.intensity;
 
             vector<float> pointSearchSqDis(NUM_MATCH_POINT);
-            auto &points_near = Nearest_Points[i]; // Nearest_Points[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
+            auto &points_near = nearPclPts[i]; // nearPclPts[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
 
             if (eskfData.converge)
             {
@@ -802,7 +891,7 @@ public:
                 continue;
 
             //拟合平面方程ax+by+cz+d=0并求解点到平面距离
-            array<double, 4> pabcd;		//平面点信息
+            array<float, 4> pabcd;		//平面点信息
             if (estiPlane(pabcd, points_near, 0.1f))
             {
                 float pd2 = pabcd[0] * point_world.x + pabcd[1] * point_world.y + pabcd[2] * point_world.z + pabcd[3]; //当前点到平面的距离
@@ -886,10 +975,10 @@ public:
         PointNoNeedDownsample.reserve(npts);
         for (int i = 0; i < npts; i++)
         {
-            if (!Nearest_Points[i].empty())
+            if (!nearPclPts[i].empty())
             {
                 //cerr << 0;
-                const PointVector &points_near = Nearest_Points[i];
+                const PointVector &points_near = nearPclPts[i];
                 bool need_add = true;
                 BoxPointType Box_of_Point;
                 PointType mid_point; //点所在体素的中心
@@ -936,10 +1025,10 @@ public:
         add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
     }   
 
-    bool estiPlane(array<double, 4> &pca_result, const PointVector &point, const double &threshold)
+    bool estiPlane(array<float, 4> &pca_result, const PointVector &point, const double &threshold)
     {
-        Eigen::Matrix<double, NUM_MATCH_POINT, 3> A;
-        Eigen::Matrix<double, NUM_MATCH_POINT, 1> b;
+        Eigen::Matrix<float, NUM_MATCH_POINT, 3> A;
+        Eigen::Matrix<float, NUM_MATCH_POINT, 1> b;
         A.setZero();
         b.setOnes();
         b *= -1.0f;
@@ -952,9 +1041,9 @@ public:
             A(j,2) = point[j].z;
         }
 
-        Eigen::Matrix<double, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
+        Eigen::Matrix<float, 3, 1> normvec = A.colPivHouseholderQr().solve(b);
 
-        double n = normvec.norm();
+        float n = normvec.norm();
         //pca_result是平面方程的4个参数  /n是为了归一化
         pca_result[0] = normvec(0) / n;
         pca_result[1] = normvec(1) / n;
@@ -999,9 +1088,23 @@ public:
     {
         sensor_msgs::PointCloud2 lidMsg;
         pcl::toROSMsg(*pclPjtDownWorld, lidMsg);
+        cerr << "publishCurPcl " << pclPjtDownWorld->points.size() << endl;
         lidMsg.header.stamp = ros::Time().fromSec(curTime);
         lidMsg.header.frame_id = pa.worldCoord;
         pubCurPcl.publish(lidMsg);
+    }
+
+    void publishDenPcl()
+    {
+        // PointCloudXYZI::Ptr pclPjtWorld(new PointCloudXYZI());
+        // ptsBody2World(pclPjtDownWorld, pclPjtWorld);
+
+        sensor_msgs::PointCloud2 lidMsg;
+        pcl::toROSMsg(*pclPjtDownWorld, lidMsg);
+        cerr << "publishDenPcl " << pclPjtDownWorld->points.size() << endl;
+        lidMsg.header.stamp = ros::Time().fromSec(curTime);
+        lidMsg.header.frame_id = pa.worldCoord;
+        pubDenPcl.publish(lidMsg);
     }
 
     void publishMap()
@@ -1034,6 +1137,9 @@ public:
 
         if (pa.enMapPub)
             publishMap();
+
+        if (pa.enDenPclPub)
+            publishDenPcl();
     }
 
 };

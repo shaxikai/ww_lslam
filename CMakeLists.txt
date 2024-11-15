@@ -70,11 +70,6 @@ include_directories(
   ${Sophus_INCLUDE_DIRS}
   include)
 
-add_message_files(
-  FILES
-  Pose6D.msg
-)
-
 generate_messages(
  DEPENDENCIES
  geometry_msgs

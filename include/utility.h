@@ -28,6 +28,8 @@
 
 #include "ikd-Tree/ikd_Tree.h"
 
+using namespace std;
+
 #define VEC_FROM_ARRAY(v)   v[0],v[1],v[2]
 #define MAT_FROM_ARRAY(v)   v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
 #define SKEW_SYM_MATRX(v)   0.0,-v[2],v[1],v[2],0.0,-v[0],-v[1],v[0],0.0
@@ -41,6 +43,27 @@ typedef pcl::PointCloud<PointType> PointCloudXYZI;
 typedef vector<PointType, Eigen::aligned_allocator<PointType>>  PointVector;
 typedef Eigen::Matrix<double, 24, 24> COV;				// 24X24的协方差矩阵
 typedef Eigen::Matrix<double, 24, 1>  StateV24;        // 24X1的向量
+
+namespace rslidar_ros
+{
+  struct EIGEN_ALIGN16 Point
+  {
+    PCL_ADD_POINT4D;
+    std::uint8_t intensity;
+    std::uint16_t ring = 0;
+    double timestamp = 0;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  };
+} // namespace rslidar_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(rslidar_ros::Point,
+                                 (float, x, x)
+                                 (float, y, y)
+                                 (float, z, z)
+                                 (std::uint8_t, intensity, intensity)
+                                 (std::uint16_t, ring, ring)
+                                 (double, timestamp, timestamp))
+
+
 
 KD_TREE<PointType> ikdtree;
 
@@ -60,6 +83,7 @@ enum TIME_UNIT
   US = 2,
   NS = 3
 };
+
 
 geometry_msgs::Pose convert2ROSPose(Sophus::SO3& rot, Eigen::Vector3d& pos)
 {
