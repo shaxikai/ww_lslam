@@ -1,0 +1,36 @@
+common:
+    lid_topic:  "/rslidar_points"
+    imu_topic:  "/imu/data"
+    lidar_type: 5               # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for rs
+    scan_line: 32
+    blind: 3
+    det_range: 100
+    fov_degree: 180
+ 
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    lid_point_cov: 0.001
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    extrinsic_T: [ 0, 0, -0.1 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+publish:
+    path_pub_en: true
+    cur_pcl_pub_en: true      
+    map_pub_en: true        
+    dense_map_pub_en: false    
+
+    path_topic: "/path"
+    cur_pcl_topic: "/cur_pcl"
+    map_topic:  "/map"
+    dense_map_topic: "/dense_map"
+
+pcd_save:
+    pcd_save_en: true
+    interval: 100                 # how many LiDAR frames saved in each pcd file; 
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

@@ -1,0 +1,36 @@
+common:
+    lid_topic:  "/points_raw"
+    imu_topic:  "/imu_raw"
+    lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+    scan_line: 6
+    blind: 4
+    det_range: 260.0
+    fov_degree: 100
+ 
+mapping:
+    filter_size_map: 0.5
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    lid_point_cov: 0.001
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    extrinsic_T: [-0.0207282, 0.0099272, -0.0124787]
+    extrinsic_R: [-0.999193,-0.030152,-0.0265481,
+                  -0.0307182,0.999304,0.0211863,
+                    0.0258908,0.0219847,-0.999423]
+
+publish:
+    path_pub_en: true
+    cur_pcl_pub_en: true      
+    map_pub_en: true        
+    dense_map_pub_en: false    
+
+    path_topic: "/path"
+    cur_pcl_topic: "/cur_pcl"
+    map_topic:  "/map"
+    dense_map_topic: "/dense_map"
+
+save:
+    map_save_type: 1        # 0 not save, 1 ikdtree map, 2 dense map;
+    map_save_path: "/home/ww/slam/lslam/ww_lslam/catkin_ws/map/"
