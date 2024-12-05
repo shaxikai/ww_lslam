@@ -5,6 +5,13 @@
 #define MAX_NUM_SIG_LID (100000)
 
 using namespace std;
+using namespace ww_lslam;
+
+#ifdef IVOX_NODE_TYPE_PHC
+    using IVoxType = IVox<3, IVoxNodeType::PHC, PointType>;
+#else
+    using IVoxType = IVox<3, IVoxNodeType::DEFAULT, PointType>;
+#endif
 
 //判断点的时间先后顺序(注意curvature中存储的是时间戳)
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
@@ -45,10 +52,9 @@ private:
         double  lidPtCov;   
 
         int     nMaxIter;                       // 卡尔曼滤波的最大迭代次数
-        double  minCornerFilterSize;            // VoxelGrid降采样时的体素大小
-        double  minSurfFilterSize;
         double  minMapFilterSize;
-        double  cubeLen;                        // 地图的局部区域的长度（FastLio2论文中有解释）
+        int     ivoxNearbyType;   
+        int     ivoxCapacity;
 
         int     mapSaveType;                      // 是否将点云地图保存到PCD文件
         string  mapSavePath;                    // 地图保存路径
@@ -156,8 +162,10 @@ private:
     bool Localmap_Initialized = false; // 局部地图是否初始化
     vector<PointVector> nearPclPts;
     pcl::VoxelGrid<PointType> downSizeFilterMap;
-
     nav_msgs::Path path;
+
+    IVoxType::Options ivox_options_;
+    std::shared_ptr<IVoxType> ivox_ = nullptr;
 
     std::mutex imuLock;
     std::mutex lidLock;
@@ -232,11 +240,31 @@ public:
         pclPjtWorld.reset(new PointCloudXYZI()); 
         pclGlobal.reset(new PointCloudXYZI()); 
 
-        ikdtree.set_downsample_param(pa.minMapFilterSize);
         downSizeFilterMap.setLeafSize(pa.minMapFilterSize, pa.minMapFilterSize, pa.minMapFilterSize);
 
         path.header.stamp = ros::Time::now();
         path.header.frame_id = pa.worldCoord;
+
+        IVoxType::Options ivox_options_;
+        ivox_options_.resolution_ = pa.minMapFilterSize;
+        ivox_options_.capacity_   = pa.ivoxCapacity;
+        switch (pa.ivoxNearbyType)
+        {
+        case 0:
+            ivox_options_.nearby_type_ = IVoxType::NearbyType::CENTER;
+            break;
+        case 16:
+            ivox_options_.nearby_type_ = IVoxType::NearbyType::NEARBY18;
+            break;
+        case 26:
+            ivox_options_.nearby_type_ = IVoxType::NearbyType::NEARBY26;
+            break;
+        default:
+            break;
+        }
+
+        ivox_ = std::make_shared<IVoxType>(ivox_options_);
+
     }
 
     void readParm()
@@ -275,8 +303,9 @@ public:
 
         nh.param<int>("mapping/max_iteration", pa.nMaxIter, 3);                   // 卡尔曼滤波的最大迭代次数
         nh.param<double>("mapping/filter_size_map", pa.minMapFilterSize, 0.5);
+        nh.param<int>("mapping/ivox_nearby_type", pa.ivoxNearbyType, 18);
+        nh.param<int>("mapping/ivox_capacity", pa.ivoxCapacity, 1000000);
         nh.param<double>("mapping/map_move_thr", pa.mapMovThr, 1.5);
-        nh.param<double>("mapping/cube_side_length", pa.cubeLen, 200);    // 地图的局部区域的长度（FastLio2论文中有解释）
 
         nh.param<vector<double>>("mapping/extrinsic_T", pa.extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
         nh.param<vector<double>>("mapping/extrinsic_R", pa.extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
@@ -468,7 +497,6 @@ public:
 
         V3D lidPos = X.pos + X.rot.matrix() * X.extrinT;
         cerr << "prei pose : " << X.pos(0) << " " << X.pos(1) << " " << X.pos(2) << endl;
-        lasermap_fov_segment(lidPos);
 
         //点云下采样
         downSizeFilterMap.setInputCloud(pclPjt);
@@ -478,10 +506,9 @@ public:
         pclPjtDownWorld->resize(npts);
         ptsBody2World(pclPjtDown, pclPjtDownWorld);
 
-        //初始化ikdtree(ikdtree为空时)
-        if (ikdtree.Root_Node == nullptr)
+        if (0 == ivox_->NumValidGrids())
         {
-            ikdtree.Build(pclPjtDownWorld->points); //根据世界坐标系下的点构建ikdtree
+            ivox_->AddPoints(pclPjtDownWorld->points);
             return;
         }
 
@@ -493,8 +520,10 @@ public:
         ptsBody2World(pclPjtDown, pclPjtDownWorld);
         map_incremental(pclPjtDownWorld);
 
+        cerr << "add " << pclPjtDownWorld->points.size() << "pts.\t" 
+             << "local map size " << ivox_->NumValidGrids() << endl;
+
         ptsBody2World(pclPjt, pclPjtWorld);
-        //*pclGlobal += *pclPjtWorld;
         publishStatus();
     }
 
@@ -750,69 +779,6 @@ public:
         pclPjt = meas.lid;
     }
 
-    void lasermap_fov_segment(V3D pos_lid)
-    {
-        vector<BoxPointType> cub_needrm;
-        BoxPointType LocalMap_Points;      // ikd-tree地图立方体的2个角点
-        cub_needrm.clear(); // 清空需要移除的区域
-
-        //初始化局部地图范围，以pos_LiD为中心,长宽高均为pa.cubeLen
-        if (!Localmap_Initialized)
-        {
-            for (int i = 0; i < 3; i++)
-            {
-                LocalMap_Points.vertex_min[i] = pos_lid(i) - pa.cubeLen / 2.0;
-                LocalMap_Points.vertex_max[i] = pos_lid(i) + pa.cubeLen / 2.0;
-            }
-            Localmap_Initialized = true;
-            return;
-        }
-
-        //各个方向上pos_LiD与局部地图边界的距离
-        float dist_to_map_edge[3][2];
-        bool need_move = false;
-        for (int i = 0; i < 3; i++)
-        {
-            dist_to_map_edge[i][0] = fabs(pos_lid(i) - LocalMap_Points.vertex_min[i]);
-            dist_to_map_edge[i][1] = fabs(pos_lid(i) - LocalMap_Points.vertex_max[i]);
-            // 与某个方向上的边界距离（1.5*300m）太小，标记需要移除need_move(FAST-LIO2论文Fig.3
-            if (dist_to_map_edge[i][0] <= pa.mapMovThr * pa.detRange || dist_to_map_edge[i][1] <= pa.mapMovThr * pa.detRange)
-                need_move = true;
-        }
-        if (!need_move)
-            return; //如果不需要，直接返回，不更改局部地图
-
-        BoxPointType New_LocalMap_Points, tmp_boxpoints;
-        New_LocalMap_Points = LocalMap_Points;
-        //需要移动的距离
-        float mov_dist = max((pa.cubeLen - 2.0 * pa.mapMovThr * pa.detRange) * 0.5 * 0.9, double(pa.detRange * (pa.mapMovThr - 1)));
-        for (int i = 0; i < 3; i++)
-        {
-            tmp_boxpoints = LocalMap_Points;
-            if (dist_to_map_edge[i][0] <= pa.mapMovThr * pa.detRange)
-            {
-                New_LocalMap_Points.vertex_max[i] -= mov_dist;
-                New_LocalMap_Points.vertex_min[i] -= mov_dist;
-                tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
-                cub_needrm.push_back(tmp_boxpoints);
-            }
-            else if (dist_to_map_edge[i][1] <= pa.mapMovThr * pa.detRange)
-            {
-                New_LocalMap_Points.vertex_max[i] += mov_dist;
-                New_LocalMap_Points.vertex_min[i] += mov_dist;
-                tmp_boxpoints.vertex_max[i] = LocalMap_Points.vertex_min[i] + mov_dist;
-                cub_needrm.push_back(tmp_boxpoints);
-            }
-        }
-        LocalMap_Points = New_LocalMap_Points;
-
-        PointVector points_history;
-        ikdtree.acquire_removed_points(points_history);
-
-        if (cub_needrm.size() > 0)
-            int count = ikdtree.Delete_Point_Boxes(cub_needrm); //删除指定范围内的点
-    }
-
     void ptBody2World(PointType const *const pi, PointType *const po)
     {
         V3D p_body(pi->x, pi->y, pi->z);
@@ -936,7 +902,8 @@ public:
             if (eskfData.converge)
             {
                 //寻找point_world的最近邻的平面点
-                ikdtree.Nearest_Search(point_world, NUM_MATCH_POINT, points_near, pointSearchSqDis);
+                //ikdtree.Nearest_Search(point_world, NUM_MATCH_POINT, points_near, pointSearchSqDis);
+                ivox_->GetClosestPoint(point_world, points_near, NUM_MATCH_POINT);
                 //判断是否是有效匹配点，与loam系列类似，要求特征点最近邻的地图点数量>阈值，距离<阈值  满足条件的才置为true
                 validPtsFlag[i] = points_near.size() < NUM_MATCH_POINT ? 
                 false : pointSearchSqDis[NUM_MATCH_POINT - 1] > 5 ? false : true;
@@ -1035,7 +1002,6 @@ public:
                 //cerr << 0;
                 const PointVector &points_near = nearPclPts[i];
                 bool need_add = true;
-                BoxPointType Box_of_Point;
                 PointType mid_point; //点所在体素的中心
                 mid_point.x = floor(lid->points[i].x / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
                 mid_point.y = floor(lid->points[i].y / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
@@ -1074,10 +1040,9 @@ public:
             }
         }
 
-        double st_time = omp_get_wtime();
-        int add_point_size = ikdtree.Add_Points(PointToAdd, true);
-        ikdtree.Add_Points(PointNoNeedDownsample, false);
-        add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
+        //FIXME
+        ivox_->AddPoints(PointToAdd);
+        ivox_->AddPoints(PointNoNeedDownsample);
     }   
 
     bool estiPlane(array<float, 4> &pca_result, const PointVector &point, const double &threshold)
@@ -1156,10 +1121,7 @@ public:
     void publishMap()
     {
         PointCloudXYZI::Ptr mapPcl(new PointCloudXYZI());
-        PointVector().swap(ikdtree.PCL_Storage);
-        ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-        mapPcl->clear();
-        mapPcl->points = ikdtree.PCL_Storage;
+        ivox_->GetAllPoints(mapPcl->points);
 
         sensor_msgs::PointCloud2 mapPclMsg;
         pcl::toROSMsg(*mapPcl, mapPclMsg);
@@ -1174,11 +1136,9 @@ public:
         PointCloudXYZI::Ptr mapPcl(new PointCloudXYZI());
         if (1 == pa.mapSaveType)
         {
-            mapName = "ikdTreeMap.pcd";
-            PointVector().swap(ikdtree.PCL_Storage);
-            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-            mapPcl->clear();
-            mapPcl->points = ikdtree.PCL_Storage;
+            // FIXME
+            //mapName = "ikdTreeMap.pcd";
+            //mapPcl->points = ikdtree.PCL_Storage;
         }
         else
         {

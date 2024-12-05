@@ -30,7 +30,7 @@
 
 #include <livox_ros_driver/CustomMsg.h>
 
-#include "ikd-Tree/ikd_Tree.h"
+#include "ivox3d/ivox3d.h"
 
 using namespace std;
 
@@ -114,17 +114,16 @@ namespace mulren_ros {
     struct EIGEN_ALIGN16 Point {
       PCL_ADD_POINT4D
       float intensity;
-      uint32_t t;
+      std::uint32_t t;
       int ring;
       EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   };
 }  // namespace velodyne_ros
  POINT_CLOUD_REGISTER_POINT_STRUCT (mulren_ros::Point,
      (float, x, x) (float, y, y) (float, z, z) (float, intensity, intensity)
-     (uint32_t, t, t) (int, ring, ring)
+     (std::uint32_t, t, t) (int, ring, ring)
  )
 
-KD_TREE<PointType> ikdtree;
 
 enum LidType
 {
