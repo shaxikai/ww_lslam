@@ -12,13 +12,14 @@
 #include <Eigen/Core>
 #include <Eigen/Eigen>
 
-#include <sophus/so3.h>
+#include <sophus/se3.h>
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/NavSatFix.h>
 
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -29,6 +30,9 @@
 #include <pcl/io/pcd_io.h>
 
 #include <livox_ros_driver/CustomMsg.h>
+
+#include <GeographicLib/Geocentric.hpp>
+#include <GeographicLib/LocalCartesian.hpp>
 
 #include "ivox3d/ivox3d.h"
 

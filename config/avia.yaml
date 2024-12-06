@@ -28,9 +28,9 @@ publish:
     map_pub_en: true        
     dense_map_pub_en: false    
 
-    path_topic: "/path"
+    loc_path_topic: "/loc_path"
     cur_pcl_topic: "/cur_pcl"
-    map_topic:  "/map"
+    loc_map_topic:  "/loc_map"
     dense_map_topic: "/dense_map"
 
 save:

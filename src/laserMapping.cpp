@@ -16,65 +16,71 @@ using namespace ww_lslam;
 //判断点的时间先后顺序(注意curvature中存储的是时间戳)
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
-class LaserMapping
+struct Param
+{
+    string  lidTopic;
+    string  imuTopic;
+    string  gpsTopic;
+
+    bool    enPathPub;
+    bool    enCurPclPub;
+    bool    enDenPclPub;
+    bool    enLocMapPub;
+
+    string  locPathTopic;
+    string  curPclTopic;
+    string  denPclTopic;
+    string  locMapTopic;
+
+    string  worldCoord;
+
+    int     lidType;                        // 激光雷达的类型
+    int     N_SCANS;                        // 激光雷达扫描的线数（livox avia为6线）
+    double  detRange;                       // 激光雷达的最大探测范围
+    double  blind;                          // 最小距离阈值，即过滤掉0～blind范围内的点云
+    int     SCAN_RATE;
+    double  fovDeg;
+
+    double  gyrCov;                         // IMU陀螺仪的协方差
+    double  accCov;                         // IMU加速度计的协方差
+    double  bGyrCov;                        // IMU陀螺仪偏置的协方差
+    double  bAccCov;                        // IMU加速度计偏置的协方差
+    double  lidPtCov;   
+
+    int     nMaxIter;                       // 卡尔曼滤波的最大迭代次数
+    double  minMapFilterSize;
+    int     ivoxNearbyType;   
+    int     ivoxCapacity;
+    double  mapMovThr;
+
+    int     mapSaveType;                      // 是否将点云地图保存到PCD文件
+    string  mapSavePath;                    // 地图保存路径
+
+    int     nPointFilter;                   // 采样间隔，即每隔point_filter_num个点取1个点
+    bool    enEstExtrinsic;
+    int     pcdSaveInterval;
+    vector<double>  extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+    vector<double>  extrinR;                // 雷达相对于IMU的外参R
+
+    //imu preint
+    double  gravity;
+    double  epsi;
+
+    bool    lioOutFlg;
+
+};
+
+struct gpsData
+{
+    double ts;
+    Vec3d pos;
+    Vec3d cov;
+};
+
+class LIO
 {
 
 private:
-
-    struct Param
-    {
-        string  lidTopic;
-        string  imuTopic;
-
-        bool    enPathPub;
-        bool    enCurPclPub;
-        bool    enDenPclPub;
-        bool    enMapPub;
-
-        string  pathTopic;
-        string  curPclTopic;
-        string  denPclTopic;
-        string  mapTopic;
-
-        string  worldCoord;
-
-        int     lidType;                        // 激光雷达的类型
-        int     N_SCANS;                        // 激光雷达扫描的线数（livox avia为6线）
-        double  detRange;                       // 激光雷达的最大探测范围
-        double  blind;                          // 最小距离阈值，即过滤掉0～blind范围内的点云
-        int     SCAN_RATE;
-        double  fovDeg;
-
-        double  gyrCov;                         // IMU陀螺仪的协方差
-        double  accCov;                         // IMU加速度计的协方差
-        double  bGyrCov;                        // IMU陀螺仪偏置的协方差
-        double  bAccCov;                        // IMU加速度计偏置的协方差
-        double  lidPtCov;   
-
-        int     nMaxIter;                       // 卡尔曼滤波的最大迭代次数
-        double  minMapFilterSize;
-        int     ivoxNearbyType;   
-        int     ivoxCapacity;
-
-        int     mapSaveType;                      // 是否将点云地图保存到PCD文件
-        string  mapSavePath;                    // 地图保存路径
-
-        int     nPointFilter;                   // 采样间隔，即每隔point_filter_num个点取1个点
-        bool    enEstExtrinsic;
-        int     pcdSaveInterval;
-        vector<double>  extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
-        vector<double>  extrinR;                // 雷达相对于IMU的外参R
-
-        //imu preint
-        double  gravity;
-
-        // eskf
-        double  epsi;
-
-        // map
-        double  mapMovThr;
-
-    };
 
     struct MeasureGroup     // Lidar data and imu dates for the current process
     {
@@ -124,16 +130,7 @@ private:
         Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> h_x; //雅可比矩阵H (公式(14)中的H)
     };
 
-    ros::NodeHandle nh;
-    Param pa;
-
-    ros::Subscriber subLid;             // 订阅原始激光点云
-    ros::Subscriber subImu;             // imu数据队列（原始数据，转lidar系下）
-
-    ros::Publisher  pubPath;
-    ros::Publisher  pubCurPcl;
-    ros::Publisher  pubDenPcl;
-    ros::Publisher  pubMap;
+    shared_ptr<Param> pa;
 
     double curTime;
 
@@ -167,47 +164,19 @@ private:
     IVoxType::Options ivox_options_;
     std::shared_ptr<IVoxType> ivox_ = nullptr;
 
+    thread processThr;
+
     std::mutex imuLock;
     std::mutex lidLock;
 
 public:
-    LaserMapping()
+    LIO(shared_ptr<Param> _pa)
     {
-        readParm();
+        pa = _pa;
 
         reset();
 
-        // 订阅原始imu数据
-        subImu = nh.subscribe(pa.imuTopic, 2000, &LaserMapping::imuHandler, this, ros::TransportHints().tcpNoDelay());
-        // 订阅原始lidar数据
-        switch (pa.lidType)
-        {
-        case MID360:
-        case AVIA:
-            subLid = nh.subscribe<livox_ros_driver::CustomMsg>(
-                     pa.lidTopic, 5, &LaserMapping::livoxLidHandler, this, ros::TransportHints().tcpNoDelay());
-            break;
-        case VELO16:
-            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
-                     pa.lidTopic, 5, &LaserMapping::velLidHandler, this, ros::TransportHints().tcpNoDelay());
-            break;
-        case RS32:
-            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
-                     pa.lidTopic, 5, &LaserMapping::rsLidHandler, this, ros::TransportHints().tcpNoDelay());
-            break;
-        case MULRAN:
-            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
-                     pa.lidTopic, 5, &LaserMapping::mulLidHandler, this, ros::TransportHints().tcpNoDelay());
-            break;
-        default:
-            break;
-        }
-
-        pubPath     = nh.advertise<nav_msgs::Path>(pa.pathTopic, 100000);
-        pubCurPcl   = nh.advertise<sensor_msgs::PointCloud2>(pa.curPclTopic, 100000);
-        pubDenPcl   = nh.advertise<sensor_msgs::PointCloud2>(pa.denPclTopic, 100000);
-        pubMap      = nh.advertise<sensor_msgs::PointCloud2>(pa.mapTopic, 100000);
-
+        processThr = thread(&LIO::process, this);
     }
 
     void reset()
@@ -216,10 +185,10 @@ public:
         imuCnt    = 1;
 
         Q = Eigen::MatrixXd::Zero(12, 12);            
-        Q.block<3, 3>(0, 0).diagonal() = V3D(pa.gyrCov, pa.gyrCov, pa.gyrCov);
-        Q.block<3, 3>(3, 3).diagonal() = V3D(pa.accCov, pa.accCov, pa.accCov);
-        Q.block<3, 3>(6, 6).diagonal() = V3D(pa.bGyrCov, pa.bGyrCov, pa.bGyrCov);
-        Q.block<3, 3>(9, 9).diagonal() = V3D(pa.bAccCov, pa.bAccCov, pa.bAccCov);
+        Q.block<3, 3>(0, 0).diagonal() = V3D(pa->gyrCov, pa->gyrCov, pa->gyrCov);
+        Q.block<3, 3>(3, 3).diagonal() = V3D(pa->accCov, pa->accCov, pa->accCov);
+        Q.block<3, 3>(6, 6).diagonal() = V3D(pa->bGyrCov, pa->bGyrCov, pa->bGyrCov);
+        Q.block<3, 3>(9, 9).diagonal() = V3D(pa->bAccCov, pa->bAccCov, pa->bAccCov);
 
         P = Eigen::MatrixXd::Identity(24,24);      //在esekfom.hpp获得P_的协方差矩阵
         P(6,6) = P(7,7) = P(8,8) = 0.00001;
@@ -228,10 +197,10 @@ public:
         P(18,18) = P(19,19) = P(20,20) = 0.001;
         P(21,21) = P(22,22) = P(23,23) = 0.00001; 
 
-        X.grav = Eigen::Vector3d(0,0,-pa.gravity);
-        X.extrinT << VEC_FROM_ARRAY(pa.extrinT);
+        X.grav = Eigen::Vector3d(0,0,-pa->gravity);
+        X.extrinT << VEC_FROM_ARRAY(pa->extrinT);
         Eigen::Matrix3d extrinR = Eigen::Matrix3d::Identity();
-        extrinR << MAT_FROM_ARRAY(pa.extrinR);
+        extrinR << MAT_FROM_ARRAY(pa->extrinR);
         X.extrinR = Sophus::SO3(extrinR);
 
         pclPjt.reset(new PointCloudXYZI()); 
@@ -240,15 +209,15 @@ public:
         pclPjtWorld.reset(new PointCloudXYZI()); 
         pclGlobal.reset(new PointCloudXYZI()); 
 
-        downSizeFilterMap.setLeafSize(pa.minMapFilterSize, pa.minMapFilterSize, pa.minMapFilterSize);
+        downSizeFilterMap.setLeafSize(pa->minMapFilterSize, pa->minMapFilterSize, pa->minMapFilterSize);
 
         path.header.stamp = ros::Time::now();
-        path.header.frame_id = pa.worldCoord;
+        path.header.frame_id = pa->worldCoord;
 
         IVoxType::Options ivox_options_;
-        ivox_options_.resolution_ = pa.minMapFilterSize;
-        ivox_options_.capacity_   = pa.ivoxCapacity;
-        switch (pa.ivoxNearbyType)
+        ivox_options_.resolution_ = pa->minMapFilterSize;
+        ivox_options_.capacity_   = pa->ivoxCapacity;
+        switch (pa->ivoxNearbyType)
         {
         case 0:
             ivox_options_.nearby_type_ = IVoxType::NearbyType::CENTER;
@@ -264,220 +233,27 @@ public:
         }
 
         ivox_ = std::make_shared<IVoxType>(ivox_options_);
-
     }
 
-    void readParm()
+    void process()
     {
-        nh.param<string>("common/coordinate", pa.worldCoord, "camera_init");         // 雷达点云topic名称
-
-        nh.param<string>("common/lid_topic", pa.lidTopic, "/livox/lidar");         // 雷达点云topic名称
-        nh.param<string>("common/imu_topic", pa.imuTopic, "/livox/imu");           // IMU的topic名称
-
-        nh.param<bool>("publish/path_pub_en", pa.enPathPub, true);
-        nh.param<bool>("publish/cur_pcl_pub_en", pa.enCurPclPub, true);
-        nh.param<bool>("publish/den_pcl_pub_en", pa.enDenPclPub, true);
-        nh.param<bool>("publish/map_pub_en", pa.enMapPub, true);
-
-        nh.param<string>("publish/path_topic", pa.pathTopic, "/path");
-        nh.param<string>("publish/cur_pcl_topic", pa.curPclTopic, "/cur_pcl");
-        nh.param<string>("publish/den_pcl_topic", pa.denPclTopic, "/den_pcl");
-        nh.param<string>("publish/map_topic", pa.mapTopic, "/map");
-
-        nh.param<int>("common/lidar_type", pa.lidType, AVIA); // 激光雷达的类型
-        nh.param<double>("common/blind", pa.blind, 0.01);        // 最小距离阈值，即过滤掉0～blind范围内的点云
-        nh.param<int>("common/scan_line", pa.N_SCANS, 16);       // 激光雷达扫描的线数（livox avia为6线）
-        nh.param<double>("common/det_range", pa.detRange, 300.f); // 激光雷达的最大探测范围
-        nh.param<double>("mapping/fov_degree", pa.fovDeg, 180);
-        nh.param<int>("common/scan_rate", pa.SCAN_RATE, 10);
-        nh.param<int>("common/point_filter_num", pa.nPointFilter, 2);           // 采样间隔，即每隔point_filter_num个点取1个点
-
-        nh.param<double>("mapping/epsi", pa.epsi, 0.001);
-        nh.param<double>("mapping/g_world", pa.gravity, 9.81);
-
-        nh.param<double>("mapping/gyr_cov", pa.gyrCov, 0.1);               // IMU陀螺仪的协方差
-        nh.param<double>("mapping/acc_cov", pa.accCov, 0.1);               // IMU加速度计的协方差
-        nh.param<double>("mapping/b_gyr_cov", pa.bGyrCov, 0.0001);        // IMU陀螺仪偏置的协方差
-        nh.param<double>("mapping/b_acc_cov", pa.bAccCov, 0.0001);        // IMU加速度计偏置的协方差
-        nh.param<double>("mapping/lid_point_cov", pa.lidPtCov, 0.001);        // IMU加速度计偏置的协方差
-
-        nh.param<int>("mapping/max_iteration", pa.nMaxIter, 3);                   // 卡尔曼滤波的最大迭代次数
-        nh.param<double>("mapping/filter_size_map", pa.minMapFilterSize, 0.5);
-        nh.param<int>("mapping/ivox_nearby_type", pa.ivoxNearbyType, 18);
-        nh.param<int>("mapping/ivox_capacity", pa.ivoxCapacity, 1000000);
-        nh.param<double>("mapping/map_move_thr", pa.mapMovThr, 1.5);
-
-        nh.param<vector<double>>("mapping/extrinsic_T", pa.extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
-        nh.param<vector<double>>("mapping/extrinsic_R", pa.extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
-
-        nh.param<int>("save/map_save_type", pa.mapSaveType, 0); // 是否将点云地图保存到PCD文件
-        nh.param<string>("save/map_save_path", pa.mapSavePath, "./PCD/");                    // 地图保存路径
-
-        cerr << "lid topic: " << pa.lidTopic << endl;
-        cerr << "imu topic: " << pa.imuTopic << endl;
-    }
-
-    void livoxLidHandler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
-    {
-        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
-        PointType pt, lastPt;
-        int nPts = msg->point_num;
-        uint gap = pa.nPointFilter;
-        for (uint i = 1; i < nPts; i+=gap)
-        {
-            auto &msgPt = msg->points[i];
-            if ((msgPt.line < pa.N_SCANS) 
-            && ((msgPt.tag & 0x30) == 0x10 || (msgPt.tag & 0x30) == 0x00)
-            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
-            {
-                pt.x = msgPt.x;
-                pt.y = msgPt.y;
-                pt.z = msgPt.z;
-                pt.intensity = msgPt.reflectivity;
-                pt.curvature = msgPt.offset_time * 1e-9; 
-
-                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
-                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
-                {
-                    pclPtr->push_back(pt);
-                    lastPt = pt;
-                }
-            }
-        }
-
-        std::lock_guard<std::mutex> lock1(lidLock);
-        lidBuffer.push_back(pclPtr);
-        timeBuffer.push_back(msg->header.stamp.toSec());
-    }
-
-    // FIXME
-    void rsLidHandler(const sensor_msgs::PointCloud2::ConstPtr &msg)
-    {
-        pcl::PointCloud<rslidar_ros::Point> rsPts;
-        pcl::fromROSMsg(*msg, rsPts);
-        int nPts = rsPts.points.size();
-
-        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
-        PointType pt, lastPt;
-        uint gap = pa.nPointFilter;
-        for (uint i = 0; i < nPts; i+=gap)
-        {
-            if (rsPts.points[i].ring < pa.N_SCANS)
-            {
-                pt.x = rsPts.points[i].x;
-                pt.y = rsPts.points[i].y;
-                pt.z = rsPts.points[i].z;
-                pt.intensity = rsPts.points[i].intensity;
-                pt.curvature = rsPts.points[i].timestamp - rsPts.points[0].timestamp; 
-
-                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
-                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
-                {
-                    pclPtr->push_back(pt);
-                    lastPt = pt;
-                }
-            }
-        }
-
-        std::lock_guard<std::mutex> lock1(lidLock);
-        lidBuffer.push_back(pclPtr);
-        timeBuffer.push_back(msg->header.stamp.toSec());
-    }
-
-    void velLidHandler(const sensor_msgs::PointCloud2::ConstPtr &msg)
-    {
-        pcl::PointCloud<velodyne_ros::Point> rsPts;
-        pcl::fromROSMsg(*msg, rsPts);
-        int nPts = rsPts.points.size();
-        uint gap = pa.nPointFilter;
-
-        PointType pt, lastPt;
-        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
-        for (uint i = 1; i < nPts; i+=gap)
-        {
-            auto &msgPt = rsPts.points[i];
-            if ((msgPt.ring < pa.N_SCANS) 
-            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
-            {
-                pt.x = msgPt.x;
-                pt.y = msgPt.y;
-                pt.z = msgPt.z;
-                pt.intensity = msgPt.intensity;
-                pt.curvature = (msgPt.time - rsPts.points[0].time); 
-
-                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
-                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
-                {
-                    pclPtr->push_back(pt);
-                    lastPt = pt;
-                }
-            }
-        }
-
-        std::lock_guard<std::mutex> lock1(lidLock);
-        lidBuffer.push_back(pclPtr);
-        timeBuffer.push_back(msg->header.stamp.toSec());
-    }
-
-    void mulLidHandler(const sensor_msgs::PointCloud2ConstPtr &msg)
-    {
-        pcl::PointCloud<mulren_ros::Point> rsPts;
-        pcl::fromROSMsg(*msg, rsPts);
-        int nPts = rsPts.points.size();
-        uint gap = pa.nPointFilter;
-        PointType pt, lastPt;
-        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
-        for (uint i = 1; i < nPts; i+=gap)
-        {
-            auto &msgPt = rsPts.points[i];
-            if ((msgPt.ring < pa.N_SCANS) 
-            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
-            {
-                pt.x = msgPt.x;
-                pt.y = msgPt.y;
-                pt.z = msgPt.z;
-                pt.intensity = msgPt.intensity;
-                pt.curvature = (rsPts.points[0].t) * 1e-9; 
-
-                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
-                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa.blind * pa.blind)))
-                {
-                    pclPtr->push_back(pt);
-                    lastPt = pt;
-                }
-            }
-        }
-
-        std::lock_guard<std::mutex> lock1(lidLock);
-        lidBuffer.push_back(pclPtr);
-        timeBuffer.push_back(msg->header.stamp.toSec());
-    }
-
-    void imuHandler(const sensor_msgs::Imu::ConstPtr &msg)
-    {
-        std::lock_guard<std::mutex> lock1(imuLock);
-        imuBuffer.push_back(msg);
-    }
-
-    void processThread()
-    {
-        ros::Rate rate(5000);
+        ros::Rate rate(1000);
 
         setNonBlocking();  // 设置终端为非阻塞模式
         while (ros::ok())
         {
             if (getKey() == 'q') break;
-            process();
+            processUnit();
             rate.sleep();
         }
 
-        if (pa.mapSaveType)
+        if (pa->mapSaveType)
         {
             saveMap();
         }
     }
 
-    void process()
+    void processUnit()
     {
         bool state = false;
 
@@ -524,7 +300,36 @@ public:
              << "local map size " << ivox_->NumValidGrids() << endl;
 
         ptsBody2World(pclPjt, pclPjtWorld);
-        publishStatus();
+
+        pa->lioOutFlg = !pa->lioOutFlg;
+    }
+
+    void imuInput(const sensor_msgs::Imu::ConstPtr &imu)
+    {
+        std::lock_guard<std::mutex> lock1(imuLock);
+        imuBuffer.push_back(imu);
+    }
+
+    void lidInput(double ts, PointCloudXYZI::Ptr &lid)
+    {
+        std::lock_guard<std::mutex> lock1(lidLock);
+        timeBuffer.push_back(ts);
+        lidBuffer.push_back(lid);
+    }
+
+    void getLidPos(Sophus::SE3 &lidPos)
+    {
+        lidPos = Sophus::SE3(X.rot, X.pos);
+    }
+
+    void getCurLid(PointCloudXYZI::Ptr &curLid)
+    {
+        curLid = pclPjtWorld;
+    }
+
+    void getLocMap(PointCloudXYZI::Ptr &locMap)
+    {
+        ivox_->GetAllPoints(locMap->points);
     }
 
     bool syncPackages(MeasureGroup &meas)
@@ -642,7 +447,7 @@ public:
 
         if (imuCnt > INI_IMU_COUNT)
         {
-            X.grav = - mean_acc / mean_acc.norm() * pa.gravity;    //得平均测量的单位方向向量 * 重力加速度预设值
+            X.grav = - mean_acc / mean_acc.norm() * pa->gravity;    //得平均测量的单位方向向量 * 重力加速度预设值
             X.bg   = mean_gyr;      //角速度测量作为陀螺仪偏差
             return true;
         }
@@ -725,7 +530,7 @@ public:
                             0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
                 dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
             }
-            acc_avr  = acc_avr * pa.gravity / mean_acc.norm();
+            acc_avr  = acc_avr * pa->gravity / mean_acc.norm();
 
             in.acc = acc_avr;
             in.gyr = angvel_avr;
@@ -810,7 +615,7 @@ public:
         StateVal x_propagated = X; //这里的x_和P_分别是经过正向传播后的状态量和协方差矩阵，因为会先调用predict函数再调用这个函数
         COV P_propagated = P;
         StateV24 dx_new = StateV24::Zero(); // 24X1的向量
-        for (int i = -1; i < pa.nMaxIter; i++) // maximum_iter是卡尔曼滤波的最大迭代次数
+        for (int i = -1; i < pa->nMaxIter; i++) // maximum_iter是卡尔曼滤波的最大迭代次数
         {
             // 计算雅克比，也就是点面残差的导数 H(代码里是h_x)
             eskfData.valid = true;
@@ -826,9 +631,9 @@ public:
             auto H = eskfData.h_x;												// m X 12 的矩阵
             Eigen::Matrix<double, 24, 24> HTH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 H^T * H
             HTH.block<12, 12>(0, 0) = H.transpose() * H;
-            auto K_front = (HTH / pa.lidPtCov + P.inverse()).inverse();
+            auto K_front = (HTH / pa->lidPtCov + P.inverse()).inverse();
             Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> K;
-            K = K_front.block<24, 12>(0, 0) * H.transpose() / pa.lidPtCov; //卡尔曼增益  这里R视为常数
+            K = K_front.block<24, 12>(0, 0) * H.transpose() / pa->lidPtCov; //卡尔曼增益  这里R视为常数
 
             Eigen::Matrix<double, 24, 24> KH = Eigen::Matrix<double, 24, 24>::Zero(); //矩阵 K * H
             KH.block<24, 12>(0, 0) = K * H;
@@ -841,7 +646,7 @@ public:
             eskfData.converge = true;
             for (int j = 0; j < 24; j++)
             {
-                if (std::fabs(dx_[j]) > pa.epsi) //如果dx>epsi 认为没有收敛
+                if (std::fabs(dx_[j]) > pa->epsi) //如果dx>epsi 认为没有收敛
                 {
                     eskfData.converge = false;
                     break;
@@ -851,13 +656,13 @@ public:
             if (eskfData.converge)
                 convergeCnt++;
 
-            if (0 == convergeCnt && i == pa.nMaxIter - 2) //如果迭代了3次还没收敛 强制令成true，h_share_model函数中会重新寻找近邻点
+            if (0 == convergeCnt && i == pa->nMaxIter - 2) //如果迭代了3次还没收敛 强制令成true，h_share_model函数中会重新寻找近邻点
             {
                 eskfData.converge = true;
             }
 
             //cerr << i << " " <<  eskfData.converge << " " << convergeCnt <<endl;
-            if (convergeCnt > 1 || i == pa.nMaxIter - 1)
+            if (convergeCnt > 1 || i == pa->nMaxIter - 1)
             {
                 P = (Eigen::Matrix<double, 24, 24>::Identity() - KH) * P; //公式(19)
                 return;
@@ -875,12 +680,7 @@ public:
 	    PointCloudXYZI::Ptr norms(new PointCloudXYZI(MAX_NUM_SIG_LID, 1));	   //特征点在地图中对应的平面参数(平面的单位法向量,以及当前点到平面距离)
         validPts->resize(npts);
         norms->resize(npts);
-
-// #ifdef MP_EN
-//         omp_set_num_threads(MP_PROC_NUM);
-// #pragma omp parallel for
-// #endif
-        
+ 
         int nValid = 0; //有效特征点的数量
         for (int i = 0; i < npts; i++) //遍历所有的特征点
         {
@@ -1003,13 +803,13 @@ public:
                 const PointVector &points_near = nearPclPts[i];
                 bool need_add = true;
                 PointType mid_point; //点所在体素的中心
-                mid_point.x = floor(lid->points[i].x / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
-                mid_point.y = floor(lid->points[i].y / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
-                mid_point.z = floor(lid->points[i].z / pa.minMapFilterSize) * pa.minMapFilterSize + 0.5 * pa.minMapFilterSize;
+                mid_point.x = floor(lid->points[i].x / pa->minMapFilterSize) * pa->minMapFilterSize + 0.5 * pa->minMapFilterSize;
+                mid_point.y = floor(lid->points[i].y / pa->minMapFilterSize) * pa->minMapFilterSize + 0.5 * pa->minMapFilterSize;
+                mid_point.z = floor(lid->points[i].z / pa->minMapFilterSize) * pa->minMapFilterSize + 0.5 * pa->minMapFilterSize;
                 float dist = calc_dist(lid->points[i], mid_point);
-                if (fabs(points_near[0].x - mid_point.x) > 0.5 * pa.minMapFilterSize 
-                && fabs(points_near[0].y - mid_point.y) > 0.5 * pa.minMapFilterSize 
-                && fabs(points_near[0].z - mid_point.z) > 0.5 * pa.minMapFilterSize)
+                if (fabs(points_near[0].x - mid_point.x) > 0.5 * pa->minMapFilterSize 
+                && fabs(points_near[0].y - mid_point.y) > 0.5 * pa->minMapFilterSize 
+                && fabs(points_near[0].z - mid_point.z) > 0.5 * pa->minMapFilterSize)
                 {
                     PointNoNeedDownsample.push_back(lid->points[i]); //如果距离最近的点都在体素外，则该点不需要Downsample
                     continue;
@@ -1087,54 +887,11 @@ public:
         return d;
     }
 
-    void publishPath()
-    {
-        geometry_msgs::PoseStamped poseMsg;
-        poseMsg.pose = convert2ROSPose(X.rot, X.pos);
-        poseMsg.header.stamp = ros::Time().fromSec(curTime);
-        poseMsg.header.frame_id = pa.worldCoord;
-
-        /*** if path is too large, the rvis will crash ***/
-        static int jjj = 0;
-        jjj++;
-        if (jjj % 3 == 0)
-        {
-            path.poses.push_back(poseMsg);
-            pubPath.publish(path);
-        }
-    }
-
-    void publishCurPcl()
-    {
-        sensor_msgs::PointCloud2 lidMsg;
-        pcl::toROSMsg(*pclPjtWorld, lidMsg);
-        lidMsg.header.stamp = ros::Time().fromSec(curTime);
-        lidMsg.header.frame_id = pa.worldCoord;
-        pubCurPcl.publish(lidMsg);
-    }
-
-    void publishDenPcl()
-    {
-
-    }
-
-    void publishMap()
-    {
-        PointCloudXYZI::Ptr mapPcl(new PointCloudXYZI());
-        ivox_->GetAllPoints(mapPcl->points);
-
-        sensor_msgs::PointCloud2 mapPclMsg;
-        pcl::toROSMsg(*mapPcl, mapPclMsg);
-        mapPclMsg.header.stamp = ros::Time().fromSec(curTime);
-        mapPclMsg.header.frame_id = pa.worldCoord;
-        pubMap.publish(mapPclMsg);
-    }   
-
     void saveMap()
     {
         string mapName;
         PointCloudXYZI::Ptr mapPcl(new PointCloudXYZI());
-        if (1 == pa.mapSaveType)
+        if (1 == pa->mapSaveType)
         {
             // FIXME
             //mapName = "ikdTreeMap.pcd";
@@ -1147,22 +904,404 @@ public:
         }
         
         pcl::PCDWriter pcdWriter;
-        string saveMapPN = pa.mapSavePath + mapName;
+        string saveMapPN = pa->mapSavePath + mapName;
         pcdWriter.writeBinary(saveMapPN, *mapPcl);
         cerr << "save map: " +  saveMapPN<< endl;
     }
 
-    void publishStatus()
+
+};
+
+class BACKEND
+{
+private:
+    
+    shared_ptr<Param> pa;
+
+    std::deque<gpsData> gpsBuffer;
+
+    bool firstGps;
+    GeographicLib::LocalCartesian gpsTrans;
+
+    thread processThr;
+
+    std::mutex gpsLock;
+
+public:
+    BACKEND(shared_ptr<Param> _pa)
     {
-        if (pa.enPathPub)
-            publishPath();
+        pa = _pa;
+        firstGps = true;
 
-        if (pa.enCurPclPub)
-            publishCurPcl();
-
-        if (pa.enMapPub)
-            publishMap();
+        processThr = thread(&BACKEND::process, this);
     }
+
+    void gpsInput(gpsData &data)
+    {
+        Vec3d pos = data.pos;
+
+        if (firstGps) 
+        {
+            firstGps  = false;
+            gpsTrans.Reset(pos(0), pos(1), pos(2));
+        }
+
+        gpsTrans.Forward(pos(0), pos(1), pos(2), data.pos(0), data.pos(1), data.pos(2));
+
+        std::lock_guard<std::mutex> lock1(gpsLock);
+        gpsBuffer.push_back(data);
+    }
+
+    void process()
+    {
+
+    }
+};
+
+class LSLAM
+{
+private:
+
+    ros::NodeHandle nh;
+    shared_ptr<Param>   pa;
+    shared_ptr<LIO>     lio;
+    shared_ptr<BACKEND> bkd;
+
+    bool rcvLioFlg;
+    Sophus::SE3 lioCurPos;
+    PointCloudXYZI::Ptr lioCurLid;
+
+
+    ros::Subscriber subLid;             // 订阅原始激光点云
+    ros::Subscriber subImu;             // imu数据队列（原始数据，转lidar系下）
+    ros::Subscriber subGPS;             
+
+
+    nav_msgs::Path path;
+    ros::Publisher  locPathPub;
+    ros::Publisher  curPclPub;
+    ros::Publisher  denPclPub;
+    ros::Publisher  locMapPub;
+
+    thread getLioOutThr;
+    thread pubStateThr;
+
+public:
+
+    LSLAM()
+    {
+        pa  = make_shared<Param>();
+        readParm();
+
+        lio = make_shared<LIO>(pa);
+        bkd = make_shared<BACKEND>(pa);
+
+        path.header.stamp = ros::Time::now();
+        path.header.frame_id = pa->worldCoord;
+
+        // 订阅原始imu数据
+        subImu = nh.subscribe(pa->imuTopic, 2000, &LSLAM::imuHandler, this, ros::TransportHints().tcpNoDelay());
+
+        // 订阅原始lidar数据
+        switch (pa->lidType)
+        {
+        case MID360:
+        case AVIA:
+            subLid = nh.subscribe<livox_ros_driver::CustomMsg>(
+                     pa->lidTopic, 5, &LSLAM::livoxLidHandler, this, ros::TransportHints().tcpNoDelay());
+            break;
+        case VELO16:
+            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
+                     pa->lidTopic, 5, &LSLAM::velLidHandler, this, ros::TransportHints().tcpNoDelay());
+            break;
+        case RS32:
+            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
+                     pa->lidTopic, 5, &LSLAM::rsLidHandler, this, ros::TransportHints().tcpNoDelay());
+            break;
+        case MULRAN:
+            subLid = nh.subscribe<sensor_msgs::PointCloud2>(
+                     pa->lidTopic, 5, &LSLAM::mulLidHandler, this, ros::TransportHints().tcpNoDelay());
+            break;
+        default:
+            break;
+        }
+
+        subGPS = nh.subscribe<sensor_msgs::NavSatFix> 
+                    (pa->gpsTopic, 200, &LSLAM::gpsHandler, this, ros::TransportHints().tcpNoDelay());
+
+        locPathPub  = nh.advertise<nav_msgs::Path>(pa->locPathTopic, 100000);
+        curPclPub   = nh.advertise<sensor_msgs::PointCloud2>(pa->curPclTopic, 100000);
+        denPclPub   = nh.advertise<sensor_msgs::PointCloud2>(pa->denPclTopic, 100000);
+        locMapPub   = nh.advertise<sensor_msgs::PointCloud2>(pa->locMapTopic, 100000);
+
+        getLioOutThr = thread(&LSLAM::getLioOutput, this);
+        pubStateThr  = thread(&LSLAM::pubState, this);
+    }
+
+    void readParm()
+    {
+        pa->lioOutFlg = false;
+
+        nh.param<string>("common/coordinate", pa->worldCoord, "camera_init");         // 雷达点云topic名称
+
+        nh.param<string>("common/lid_topic", pa->lidTopic, "/livox/lidar");         // 雷达点云topic名称
+        nh.param<string>("common/imu_topic", pa->imuTopic, "/livox/imu");           // IMU的topic名称
+        nh.param<string>("common/gps_topic", pa->gpsTopic, "/gps");           // IMU的topic名称
+
+        nh.param<bool>("publish/path_pub_en", pa->enPathPub, true);
+        nh.param<bool>("publish/cur_pcl_pub_en", pa->enCurPclPub, true);
+        nh.param<bool>("publish/den_pcl_pub_en", pa->enDenPclPub, true);
+        nh.param<bool>("publish/map_pub_en", pa->enLocMapPub, true);
+
+        nh.param<string>("publish/loc_path_topic", pa->locPathTopic, "/loc_path");
+        nh.param<string>("publish/cur_pcl_topic", pa->curPclTopic, "/cur_pcl");
+        nh.param<string>("publish/den_pcl_topic", pa->denPclTopic, "/den_pcl");
+        nh.param<string>("publish/loc_map_topic", pa->locMapTopic, "/loc_map");
+
+        nh.param<int>("common/lidar_type", pa->lidType, AVIA); // 激光雷达的类型
+        nh.param<double>("common/blind", pa->blind, 0.01);        // 最小距离阈值，即过滤掉0～blind范围内的点云
+        nh.param<int>("common/scan_line", pa->N_SCANS, 16);       // 激光雷达扫描的线数（livox avia为6线）
+        nh.param<double>("common/det_range", pa->detRange, 300.f); // 激光雷达的最大探测范围
+        nh.param<double>("mapping/fov_degree", pa->fovDeg, 180);
+        nh.param<int>("common/scan_rate", pa->SCAN_RATE, 10);
+        nh.param<int>("common/point_filter_num", pa->nPointFilter, 2);           // 采样间隔，即每隔point_filter_num个点取1个点
+
+        nh.param<double>("mapping/epsi", pa->epsi, 0.001);
+        nh.param<double>("mapping/g_world", pa->gravity, 9.81);
+
+        nh.param<double>("mapping/gyr_cov", pa->gyrCov, 0.1);               // IMU陀螺仪的协方差
+        nh.param<double>("mapping/acc_cov", pa->accCov, 0.1);               // IMU加速度计的协方差
+        nh.param<double>("mapping/b_gyr_cov", pa->bGyrCov, 0.0001);        // IMU陀螺仪偏置的协方差
+        nh.param<double>("mapping/b_acc_cov", pa->bAccCov, 0.0001);        // IMU加速度计偏置的协方差
+        nh.param<double>("mapping/lid_point_cov", pa->lidPtCov, 0.001);        // IMU加速度计偏置的协方差
+
+        nh.param<int>("mapping/max_iteration", pa->nMaxIter, 3);                   // 卡尔曼滤波的最大迭代次数
+        nh.param<double>("mapping/filter_size_map", pa->minMapFilterSize, 0.5);
+        nh.param<int>("mapping/ivox_nearby_type", pa->ivoxNearbyType, 18);
+        nh.param<int>("mapping/ivox_capacity", pa->ivoxCapacity, 1000000);
+        nh.param<double>("mapping/map_move_thr", pa->mapMovThr, 1.5);
+
+        nh.param<vector<double>>("mapping/extrinsic_T", pa->extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+        nh.param<vector<double>>("mapping/extrinsic_R", pa->extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
+
+        nh.param<int>("save/map_save_type", pa->mapSaveType, 0); // 是否将点云地图保存到PCD文件
+        nh.param<string>("save/map_save_path", pa->mapSavePath, "./PCD/");                    // 地图保存路径
+
+        cerr << "lid topic: " << pa->lidTopic << endl;
+        cerr << "imu topic: " << pa->imuTopic << endl;
+    }
+
+    void imuHandler(const sensor_msgs::Imu::ConstPtr &msg)
+    {
+        lio->imuInput(msg);
+    }
+
+    void livoxLidHandler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
+    {
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        PointType pt, lastPt;
+        int nPts = msg->point_num;
+        uint gap = pa->nPointFilter;
+        for (uint i = 1; i < nPts; i+=gap)
+        {
+            auto &msgPt = msg->points[i];
+            if ((msgPt.line < pa->N_SCANS) 
+            && ((msgPt.tag & 0x30) == 0x10 || (msgPt.tag & 0x30) == 0x00)
+            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
+            {
+                pt.x = msgPt.x;
+                pt.y = msgPt.y;
+                pt.z = msgPt.z;
+                pt.intensity = msgPt.reflectivity;
+                pt.curvature = msgPt.offset_time * 1e-9; 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa->blind * pa->blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+
+        double ts = msg->header.stamp.toSec();
+        lio->lidInput(ts, pclPtr);
+    }
+
+    void rsLidHandler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+    {
+        pcl::PointCloud<rslidar_ros::Point> rsPts;
+        pcl::fromROSMsg(*msg, rsPts);
+        int nPts = rsPts.points.size();
+
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        PointType pt, lastPt;
+        uint gap = pa->nPointFilter;
+        for (uint i = 0; i < nPts; i+=gap)
+        {
+            if (rsPts.points[i].ring < pa->N_SCANS)
+            {
+                pt.x = rsPts.points[i].x;
+                pt.y = rsPts.points[i].y;
+                pt.z = rsPts.points[i].z;
+                pt.intensity = rsPts.points[i].intensity;
+                pt.curvature = rsPts.points[i].timestamp - rsPts.points[0].timestamp; 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa->blind * pa->blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+
+        double ts = msg->header.stamp.toSec();
+        lio->lidInput(ts, pclPtr);
+    }
+
+    void velLidHandler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+    {
+        pcl::PointCloud<velodyne_ros::Point> rsPts;
+        pcl::fromROSMsg(*msg, rsPts);
+        int nPts = rsPts.points.size();
+        uint gap = pa->nPointFilter;
+
+        PointType pt, lastPt;
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        for (uint i = 1; i < nPts; i+=gap)
+        {
+            auto &msgPt = rsPts.points[i];
+            if ((msgPt.ring < pa->N_SCANS) 
+            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
+            {
+                pt.x = msgPt.x;
+                pt.y = msgPt.y;
+                pt.z = msgPt.z;
+                pt.intensity = msgPt.intensity;
+                pt.curvature = (msgPt.time - rsPts.points[0].time); 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa->blind * pa->blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+        double ts = msg->header.stamp.toSec();
+        lio->lidInput(ts, pclPtr);
+    }
+
+    void mulLidHandler(const sensor_msgs::PointCloud2ConstPtr &msg)
+    {
+        pcl::PointCloud<mulren_ros::Point> rsPts;
+        pcl::fromROSMsg(*msg, rsPts);
+        int nPts = rsPts.points.size();
+        uint gap = pa->nPointFilter;
+        PointType pt, lastPt;
+        PointCloudXYZI::Ptr pclPtr(new PointCloudXYZI());
+        for (uint i = 1; i < nPts; i+=gap)
+        {
+            auto &msgPt = rsPts.points[i];
+            if ((msgPt.ring < pa->N_SCANS) 
+            && ((abs(msgPt.x) > 1e-7) || (abs(msgPt.y) > 1e-7) || (abs(msgPt.z) > 1e-7)))
+            {
+                pt.x = msgPt.x;
+                pt.y = msgPt.y;
+                pt.z = msgPt.z;
+                pt.intensity = msgPt.intensity;
+                pt.curvature = (rsPts.points[0].t) * 1e-9; 
+
+                if ((abs(pt.x - lastPt.x) > 1e-7) || (abs(pt.y - lastPt.y) > 1e-7) || (abs(pt.z - lastPt.z) > 1e-7) 
+                && (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z > (pa->blind * pa->blind)))
+                {
+                    pclPtr->push_back(pt);
+                    lastPt = pt;
+                }
+            }
+        }
+
+        double ts = msg->header.stamp.toSec();
+        lio->lidInput(ts, pclPtr);
+    }
+
+    void gpsHandler(const sensor_msgs::NavSatFixConstPtr& msg)
+    {
+        gpsData data;
+        data.ts  = msg->header.stamp.toSec();
+        data.pos = Vec3d(msg->latitude, msg->longitude, msg->altitude);
+        data.cov = Vec3d(msg->position_covariance[0], msg->position_covariance[4], msg->position_covariance[8]);
+        bkd->gpsInput(data);
+    }
+
+    void getLioOutput()
+    {
+        rcvLioFlg = false;
+
+        ros::Rate rate(50000);
+        while (ros::ok())
+        {     
+            if (rcvLioFlg != pa->lioOutFlg)
+            {
+                lio->getLidPos(lioCurPos);
+                lio->getCurLid(lioCurLid);
+                rcvLioFlg = pa->lioOutFlg;
+            }
+            rate.sleep();
+        }
+    }
+
+    void pubState()
+    {
+        bool tmpRcvLioFlg  = false;
+
+        ros::Rate rate(50000);
+        while (ros::ok())
+        {     
+            if (tmpRcvLioFlg != rcvLioFlg)
+            {
+                pubPath(locPathPub, lioCurPos);
+                pubPcl(curPclPub, lioCurLid);
+
+                PointCloudXYZI::Ptr pts(new PointCloudXYZI);
+                lio->getLocMap(pts);
+                pubPcl(locMapPub, pts);
+
+                tmpRcvLioFlg = rcvLioFlg;
+            }
+
+            rate.sleep();
+        }
+    }
+
+    void pubPose()
+    {
+        
+    }
+
+    void pubPath(ros::Publisher &pub, Sophus::SE3 &pos)
+    {
+        geometry_msgs::PoseStamped poseMsg;
+        poseMsg.pose = convert2ROSPose(pos.so3(), pos.translation());
+        poseMsg.header.stamp = ros::Time().fromSec(0.0);
+        poseMsg.header.frame_id = pa->worldCoord;
+        path.poses.push_back(poseMsg);
+        pub.publish(path);
+    }
+
+    void pubPcl(ros::Publisher &pub, PointCloudXYZI::Ptr &pts)
+    {
+        if (pts->points.empty())
+            return;
+
+        sensor_msgs::PointCloud2 lidMsg;
+        pcl::toROSMsg(*pts, lidMsg);
+        lidMsg.header.stamp = ros::Time().fromSec(0.0);
+        lidMsg.header.frame_id = pa->worldCoord;
+        pub.publish(lidMsg);
+    }
+
 
 };
 
@@ -1170,9 +1309,7 @@ int main(int argc, char** argv)
 {
     ros::init(argc, argv, "ww_lio_map");
 
-    LaserMapping LP;
-    
-    thread loopthread(&LaserMapping::processThread, &LP);
+    LSLAM slam;
 
     ros::spin();
     

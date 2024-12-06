@@ -58,6 +58,9 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
 find_package(Glog REQUIRED)
+find_package(GTSAM REQUIRED)
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
+find_package(GeographicLib REQUIRED)
 set( Sophus_INCLUDE_DIRS  "/home/ww/tools/Sophus;/usr/include/eigen3" )
 set( Sophus_LIBRARIES    "/home/ww/tools/Sophus/build/libSophus.so" )
 
@@ -72,6 +75,7 @@ include_directories(
   ${PYTHON_INCLUDE_DIRS}
   ${Sophus_INCLUDE_DIRS}
   ${Glog_INCLUDE_DIRS}
+	${GTSAM_INCLUDE_DIR}
   include)
 
 generate_messages(
@@ -86,7 +90,7 @@ catkin_package(
 )
 
 add_executable(ww_lio_map src/laserMapping.cpp)
-target_link_libraries(ww_lio_map ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${Sophus_LIBRARIES} glog)
+target_link_libraries(ww_lio_map ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${Sophus_LIBRARIES} ${GeographicLib_LIBRARIES} gtsam glog)
 target_include_directories(ww_lio_map PRIVATE ${PYTHON_INCLUDE_DIRS})
 
 # add_executable(ww_lio_loc src/laserLocalization.cpp)

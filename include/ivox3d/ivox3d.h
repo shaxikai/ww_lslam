@@ -284,6 +284,7 @@ void IVox<dim, node_type, PointType>::AddPoints(const PointVector& points_to_add
 
 template <int dim, IVoxNodeType node_type, typename PointType>
 void IVox<dim, node_type, PointType>::GetAllPoints(PointVector& pts) {
+    pts.clear();
     for (auto it = grids_map_.begin(); it != grids_map_.end(); ++it) {
         Eigen::Matrix<int, dim, 1> key = it->first;
         PointType pt;
