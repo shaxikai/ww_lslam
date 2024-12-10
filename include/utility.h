@@ -1,3 +1,6 @@
+#ifndef UTILITY_H
+#define UTILITY_H
+
 #include <iomanip> 
 #include <vector>
 #include <array>
@@ -33,6 +36,20 @@
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
+
+#include <gtsam/geometry/Rot3.h>
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/navigation/GPSFactor.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/Marginals.h>
+#include <gtsam/nonlinear/Values.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/ISAM2.h>
 
 #include "ivox3d/ivox3d.h"
 
@@ -148,6 +165,70 @@ enum TIME_UNIT
   NS = 3
 };
 
+struct Param
+{
+    string  lidTopic;
+    string  imuTopic;
+    string  gpsTopic;
+
+    bool    enPathPub;
+    bool    enCurPclPub;
+    bool    enDenPclPub;
+    bool    enLocMapPub;
+
+    string  locPthTopic;
+    string  curPclTopic;
+    string  denPclTopic;
+    string  locMapTopic;
+    string  gloPthTopic;
+    string  gpsPthTopic;
+
+    string  worldCoord;
+
+    int     lidType;                        // 激光雷达的类型
+    int     N_SCANS;                        // 激光雷达扫描的线数（livox avia为6线）
+    double  detRange;                       // 激光雷达的最大探测范围
+    double  blind;                          // 最小距离阈值，即过滤掉0～blind范围内的点云
+    int     SCAN_RATE;
+    double  fovDeg;
+
+    double  gyrCov;                         // IMU陀螺仪的协方差
+    double  accCov;                         // IMU加速度计的协方差
+    double  bGyrCov;                        // IMU陀螺仪偏置的协方差
+    double  bAccCov;                        // IMU加速度计偏置的协方差
+    double  lidPtCov;   
+
+    int     nMaxIter;                       // 卡尔曼滤波的最大迭代次数
+    double  minMapFilterSize;
+    int     ivoxNearbyType;   
+    int     ivoxCapacity;
+    double  mapMovThr;
+
+    int     mapSaveType;                      // 是否将点云地图保存到PCD文件
+    string  mapSavePath;                    // 地图保存路径
+
+    int     nPointFilter;                   // 采样间隔，即每隔point_filter_num个点取1个点
+    bool    enEstExtrinsic;
+    int     pcdSaveInterval;
+    vector<double>  extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+    vector<double>  extrinR;                // 雷达相对于IMU的外参R
+
+    double  keyAngThr;
+    double  keyTraThr;
+
+    //imu preint
+    double  gravity;
+    double  epsi;
+
+    bool    enGPS;
+    double  gpsCovThr;
+
+    bool    lioOutFlg;
+    bool    bkdOutFlg;
+
+};
+
+
 // 设置终端为非阻塞模式
 void setNonBlocking() {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);  // 获取当前文件描述符的标志
@@ -163,6 +244,19 @@ char getKey()
     return 0;  // 没有输入时返回 0
 }
 
+void convert2GtsamPose(Sophus::SE3 &se3, gtsam::Pose3 &pos)
+{
+  gtsam::Rot3 rotationGTSAM(se3.rotation_matrix());
+  gtsam::Point3 translationGTSAM(se3.translation());
+  pos = gtsam::Pose3(rotationGTSAM, translationGTSAM);
+}
+
+void convert2SE3(gtsam::Pose3 &pos, Sophus::SE3 &se3)
+{
+  Eigen::Matrix<double, 3, 3> R = pos.rotation().matrix();
+  Eigen::Vector3d t = pos.translation();
+  se3 = Sophus::SE3(R, t);
+}
 
 geometry_msgs::Pose convert2ROSPose(Sophus::SO3& rot, Eigen::Vector3d& pos)
 {
@@ -180,3 +274,4 @@ geometry_msgs::Pose convert2ROSPose(Sophus::SO3& rot, Eigen::Vector3d& pos)
     return out;
 }
 
+#endif // UTILITY_H

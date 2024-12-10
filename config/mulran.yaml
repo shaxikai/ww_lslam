@@ -16,13 +16,18 @@ mapping:
     gyr_cov: 0.1
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
-
     lid_point_cov: 0.001
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
     extrinsic_T: [ 1.77, -0.00, -0.05 ]
     extrinsic_R: [ -1, 0, 0,
                    0, -1, 0,
                    0, 0, 1]
+
+gps:
+    en_gps: false;
+    gps_cov_thr: 100
+
+
 
 publish:
     path_pub_en: true
