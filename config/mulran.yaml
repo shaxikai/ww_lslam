@@ -24,10 +24,8 @@ mapping:
                    0, 0, 1]
 
 gps:
-    en_gps: false;
+    en_gps: true
     gps_cov_thr: 100
-
-
 
 publish:
     path_pub_en: true

@@ -12,7 +12,8 @@ private:
     std::shared_ptr<BACKEND> bkd;
 
     bool rcvLioFlg;
-    Sophus::SE3 lioCurPos;
+    double lioCurTs;
+    Sophus::SE3 lioBdyPos;
     PointCloudXYZI::Ptr lioCurLid;
 
 
@@ -25,6 +26,7 @@ private:
     ros::Publisher  curPclPub;
     ros::Publisher  denPclPub;
     ros::Publisher  locMapPub;
+    ros::Publisher  gloMapPub;
 
     ros::Publisher  gloPthPub;
     ros::Publisher  gpsPthPub;
@@ -81,6 +83,7 @@ public:
         curPclPub = nh.advertise<sensor_msgs::PointCloud2>(pa->curPclTopic, 100000);
         denPclPub = nh.advertise<sensor_msgs::PointCloud2>(pa->denPclTopic, 100000);
         locMapPub = nh.advertise<sensor_msgs::PointCloud2>(pa->locMapTopic, 100000);
+        gloMapPub = nh.advertise<sensor_msgs::PointCloud2>(pa->gloMapTopic, 100000);
 
         getLioOutThr = thread(&LSLAM::getLioOutput, this);
         pubStateThr  = thread(&LSLAM::pubState, this);
@@ -106,6 +109,7 @@ public:
         nh.param<string>("publish/cur_pcl_topic", pa->curPclTopic, "/cur_pcl");
         nh.param<string>("publish/den_pcl_topic", pa->denPclTopic, "/den_pcl");
         nh.param<string>("publish/loc_map_topic", pa->locMapTopic, "/loc_map");
+        nh.param<string>("publish/glo_map_topic", pa->gloMapTopic, "/glo_map");
         nh.param<string>("publish/glo_path_topic", pa->gloPthTopic, "/glo_path");
         nh.param<string>("publish/gps_path_topic", pa->gpsPthTopic, "/gps_path");
 
@@ -135,14 +139,19 @@ public:
         nh.param<double>("mapping/key_ang_thr", pa->keyAngThr, 0.2);
         nh.param<double>("mapping/key_tra_thr", pa->keyTraThr, 1.0);
 
-        nh.param<vector<double>>("mapping/extrinsic_T", pa->extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
-        nh.param<vector<double>>("mapping/extrinsic_R", pa->extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
+        vector<double> extrinR;
+        vector<double> extrinT;
+        nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>(3, 0.0)); // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+        nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>(9, 0.0)); // 雷达相对于IMU的外参R
 
         nh.param<bool>("gps/en_gps", pa->enGPS, false);   
         nh.param<double>("gps/gps_cov_thr", pa->gpsCovThr, 10.0);       
 
         nh.param<int>("save/map_save_type", pa->mapSaveType, 0); // 是否将点云地图保存到PCD文件
         nh.param<string>("save/map_save_path", pa->mapSavePath, "./PCD/");                    // 地图保存路径
+
+        pa->extrinT << VEC_FROM_ARRAY(extrinT);
+        pa->extrinR << MAT_FROM_ARRAY(extrinR);
 
         cerr << "lid topic: " << pa->lidTopic << endl;
         cerr << "imu topic: " << pa->imuTopic << endl;
@@ -307,12 +316,14 @@ public:
             if (rcvLioFlg != pa->lioOutFlg)
             {
                 lio->getOutData(lioOutData);
-                lioCurPos = lioOutData.pos;
+                lioCurTs  = lioOutData.ts;
+                lioBdyPos = lioOutData.pos;
                 lioCurLid = lioOutData.lid;
 
                 bkdInData.ts  = lioOutData.ts;
                 bkdInData.pos = lioOutData.pos;
                 bkdInData.cov = lioOutData.cov;
+                bkdInData.lid = lioOutData.lid;
                 bkd->lidInput(bkdInData);
 
                 rcvLioFlg = pa->lioOutFlg;
@@ -327,14 +338,19 @@ public:
         bool tmpRcvBkdFlg = false;
 
         ros::Rate rate(50000);
+        double tmpTs = 0;
         while (ros::ok())
         {     
             if (tmpRcvLioFlg != rcvLioFlg)
             {
                 pubLocPath();
-                pubPcl(curPclPub, lioCurLid);
 
                 PointCloudXYZI::Ptr pts(new PointCloudXYZI);
+                Sophus::SE3 tmpLidPos = lioBdyPos * Sophus::SE3(pa->extrinR, pa->extrinT);
+                ptsLid2World(lioCurLid, tmpLidPos, pts);
+                pubPcl(curPclPub, pts);
+
+                pts->clear();
                 lio->getLocMap(pts);
                 pubPcl(locMapPub, pts);
 
@@ -348,6 +364,14 @@ public:
                 bkd->getOutData(data);
                 pubPath(gloPthPub, data.pth);
                 pubPath(gpsPthPub, data.gpsPth);
+
+                if (tmpTs + 10. < lioCurTs)
+                {
+                    PointCloudXYZI::Ptr map(new PointCloudXYZI);
+                    bkd->getGloMap(map);
+                    pubPcl(gloMapPub, map); 
+                    tmpTs = lioCurTs;
+                }
 
                 tmpRcvBkdFlg = pa->bkdOutFlg;
             }
@@ -364,7 +388,7 @@ public:
     void pubLocPath()
     {
         geometry_msgs::PoseStamped poseMsg;
-        poseMsg.pose = convert2ROSPose(lioCurPos.so3(), lioCurPos.translation());
+        poseMsg.pose = convert2ROSPose(lioBdyPos.so3(), lioBdyPos.translation());
         poseMsg.header.stamp = ros::Time().fromSec(0.0);
         poseMsg.header.frame_id = pa->worldCoord;
         locPth.poses.push_back(poseMsg);

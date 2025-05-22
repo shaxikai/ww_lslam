@@ -89,8 +89,18 @@ catkin_package(
   INCLUDE_DIRS
 )
 
-add_executable(ww_lio_map src/laserMapping.cpp)
-target_link_libraries(ww_lio_map ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${Sophus_LIBRARIES} ${GeographicLib_LIBRARIES} gtsam glog)
+set(WW_LIO_MAP_LIBS
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  ${PYTHON_LIBRARIES}
+  ${Sophus_LIBRARIES}
+  ${GeographicLib_LIBRARIES}
+  gtsam
+  glog
+)
+
+add_executable(ww_lio_map src/laserMapping.cpp include/Scancontext.cpp)
+target_link_libraries(ww_lio_map ${WW_LIO_MAP_LIBS})
 target_include_directories(ww_lio_map PRIVATE ${PYTHON_INCLUDE_DIRS})
 
 # add_executable(ww_lio_loc src/laserLocalization.cpp)

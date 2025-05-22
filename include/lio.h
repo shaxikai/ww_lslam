@@ -146,10 +146,8 @@ public:
         P(21,21) = P(22,22) = P(23,23) = 0.00001; 
 
         X.grav = Eigen::Vector3d(0,0,-pa->gravity);
-        X.extrinT << VEC_FROM_ARRAY(pa->extrinT);
-        Eigen::Matrix3d extrinR = Eigen::Matrix3d::Identity();
-        extrinR << MAT_FROM_ARRAY(pa->extrinR);
-        X.extrinR = Sophus::SO3(extrinR);
+        X.extrinT = pa->extrinT;
+        X.extrinR = Sophus::SO3(pa->extrinR);
 
         pclPjt.reset(new PointCloudXYZI()); 
         pclPjtDown.reset(new PointCloudXYZI());
@@ -284,7 +282,7 @@ public:
     {
         data.ts  = curTime;
         data.pos = Sophus::SE3(X.rot, X.pos);
-        data.lid = pclPjtWorld;
+        data.lid = pclPjt;
 
         data.cov(0) = P(3,3), data.cov(1) = P(4,4), data.cov(2) = P(5,5);
         data.cov(3) = P(0,0), data.cov(4) = P(1,1), data.cov(5) = P(2,2);

@@ -5,8 +5,8 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Global Options1
-        - /mapping1/curPcl1
-        - /mapping1/map1
+        - /mapping1
+        - /mapping1/gloMap1
         - /Path2
       Splitter Ratio: 0.6432291865348816
     Tree Height: 775
@@ -27,7 +27,7 @@ Panels:
   - Class: rviz/Time
     Name: Time
     SyncMode: 0
-    SyncSource: curPcl
+    SyncSource: locMap
 Preferences:
   PromptSaveOnExit: true
 Toolbars:
@@ -67,8 +67,8 @@ Visualization Manager:
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: 24.879653930664062
-            Min Value: -3.7680630683898926
+            Max Value: 82.41840362548828
+            Min Value: 36.38024139404297
             Value: true
           Axis: Z
           Channel Name: intensity
@@ -76,7 +76,7 @@ Visualization Manager:
           Color: 255; 255; 255
           Color Transformer: AxisColor
           Decay Time: 0
-          Enabled: true
+          Enabled: false
           Invert Rainbow: true
           Max Color: 255; 255; 255
           Min Color: 0; 0; 0
@@ -91,12 +91,12 @@ Visualization Manager:
           Unreliable: true
           Use Fixed Frame: true
           Use rainbow: true
-          Value: true
+          Value: false
         - Alpha: 0.10000000149011612
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: -9999
-            Min Value: 9999
+            Max Value: 45.50212478637695
+            Min Value: 7.4161810874938965
             Value: true
           Axis: Z
           Channel Name: intensity
@@ -123,8 +123,8 @@ Visualization Manager:
         - Alpha: 1
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
-            Max Value: 25
-            Min Value: -4.5
+            Max Value: 94.5
+            Min Value: 28
             Value: true
           Axis: Z
           Channel Name: curvature
@@ -136,7 +136,7 @@ Visualization Manager:
           Invert Rainbow: false
           Max Color: 255; 255; 255
           Min Color: 238; 238; 236
-          Name: map
+          Name: locMap
           Position Transformer: XYZ
           Queue Size: 1
           Selectable: false
@@ -144,6 +144,34 @@ Visualization Manager:
           Size (m): 0.05000000074505806
           Style: Points
           Topic: /loc_map
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: true
+        - Alpha: 1
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 10
+            Min Value: -10
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz/PointCloud2
+          Color: 255; 255; 255
+          Color Transformer: Intensity
+          Decay Time: 0
+          Enabled: true
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: gloMap
+          Position Transformer: XYZ
+          Queue Size: 10
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.10000000149011612
+          Style: Flat Squares
+          Topic: /glo_map
           Unreliable: false
           Use Fixed Frame: true
           Use rainbow: true
@@ -226,7 +254,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 86.16636657714844
+      Distance: 903.5985107421875
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -234,17 +262,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -16.37479591369629
-        Y: 9.26292896270752
-        Z: 12.615325927734375
+        X: 252.14295959472656
+        Y: -71.68473052978516
+        Z: 111.55422973632812
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.8097963929176331
+      Pitch: 1.1847963333129883
       Target Frame: global
-      Yaw: 4.3853960037231445
+      Yaw: 4.690396785736084
     Saved: ~
 Window Geometry:
   Displays:

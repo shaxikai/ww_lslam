@@ -180,6 +180,7 @@ struct Param
     string  curPclTopic;
     string  denPclTopic;
     string  locMapTopic;
+    string  gloMapTopic;
     string  gloPthTopic;
     string  gpsPthTopic;
 
@@ -210,8 +211,8 @@ struct Param
     int     nPointFilter;                   // 采样间隔，即每隔point_filter_num个点取1个点
     bool    enEstExtrinsic;
     int     pcdSaveInterval;
-    vector<double>  extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
-    vector<double>  extrinR;                // 雷达相对于IMU的外参R
+    Vec3d   extrinT;                // 雷达相对于IMU的外参T（即雷达在IMU坐标系中的坐标）
+    Mat3d   extrinR;                // 雷达相对于IMU的外参R
 
     double  keyAngThr;
     double  keyTraThr;
@@ -222,6 +223,8 @@ struct Param
 
     bool    enGPS;
     double  gpsCovThr;
+
+    bool    enLoop;
 
     bool    lioOutFlg;
     bool    bkdOutFlg;
@@ -272,6 +275,19 @@ geometry_msgs::Pose convert2ROSPose(Sophus::SO3& rot, Eigen::Vector3d& pos)
     out.orientation.w = q.coeffs()[3];
 
     return out;
+}
+
+void ptsLid2World(PointCloudXYZI::Ptr &inPts, Sophus::SE3 &pos, PointCloudXYZI::Ptr &outPts)
+{
+  if (inPts->empty()) return;
+  pcl::copyPointCloud(*inPts, *outPts);
+  for (auto& point : *outPts) {
+      Vec3d ptBody(point.x, point.y, point.z);
+      Vec3d ptWorld = pos * ptBody;
+      point.x = ptWorld(0);
+      point.y = ptWorld(1);
+      point.z = ptWorld(2);
+  }
 }
 
 #endif // UTILITY_H
